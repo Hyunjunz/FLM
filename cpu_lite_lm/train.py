@@ -218,7 +218,7 @@ def train(args: argparse.Namespace) -> Path:
             saw_batch = True
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                out = model(**batch)
+                out = model(**batch, multi_exit_loss=args.multi_exit_loss)
                 loss = out.loss / args.grad_accum_steps
             scaler.scale(loss).backward()
             running_loss += float(out.loss.detach().item())
@@ -314,6 +314,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-skip-docs", type=int, default=0)
     parser.add_argument("--eval-max-chars", type=int, default=200_000)
     parser.add_argument("--eval-max-batches", type=int, default=20)
+    parser.add_argument("--multi-exit-loss", action="store_true", help="Enable loss for intermediate layers")
     return parser
 
 

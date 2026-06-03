@@ -197,7 +197,7 @@ def train_sft(args: argparse.Namespace) -> Path:
         for batch in train_loader:
             batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                out = model(**batch)
+                out = model(**batch, multi_exit_loss=args.multi_exit_loss)
                 loss = out.loss / args.grad_accum_steps
             scaler.scale(loss).backward()
             running_loss += float(out.loss.detach().item())
@@ -281,6 +281,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-every", type=int, default=500)
+    parser.add_argument("--multi-exit-loss", action="store_true", help="Enable loss for intermediate layers")
     return parser
 
 

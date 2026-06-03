@@ -42,14 +42,26 @@ def generate(args: argparse.Namespace) -> str:
     model = load_model(args.model, args.config).to(device).eval()
     ids = torch.tensor([tokenizer.encode(args.prompt).ids], dtype=torch.long, device=device)
     amp_dtype = _amp_dtype(args.amp_dtype)
+    
     with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-        out = model.generate_simple(
-            ids,
-            max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            top_k=args.top_k,
-            use_cache=not args.no_cache,
-        )
+        if args.speculative:
+            from .speculative import SelfSpeculativeGenerator
+            generator = SelfSpeculativeGenerator(model, draft_layer=args.draft_layer, lookahead=args.lookahead)
+            out = generator.generate(
+                ids,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                eos_token_id=tokenizer.token_to_id("</s>") or tokenizer.token_to_id("<|endoftext|>"),
+            )
+        else:
+            out = model.generate_simple(
+                ids,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                use_cache=not args.no_cache,
+            )
+            
     text = tokenizer.decode(out[0].detach().cpu().tolist(), skip_special_tokens=True)
     try:
         print(text)
@@ -71,6 +83,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp-dtype", choices=["off", "fp16", "bf16"], default="off")
+    parser.add_argument("--speculative", action="store_true", help="Use self-speculative decoding")
+    parser.add_argument("--draft-layer", type=int, default=1, help="Layer to exit for draft prediction")
+    parser.add_argument("--lookahead", type=int, default=3, help="Number of tokens to speculate")
     return parser
 
 

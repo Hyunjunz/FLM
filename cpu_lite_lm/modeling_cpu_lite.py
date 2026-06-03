@@ -128,6 +128,7 @@ class CPULiteAttention(nn.Module):
         position_ids: torch.Tensor,
         past_key_value: Optional[PastKeyValue] = None,
         use_cache: bool = False,
+        cache_position: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[PastKeyValue]]:
         bsz, q_len, _ = hidden_states.shape
         query = self._shape(self.q_proj(hidden_states), self.num_heads)
@@ -137,8 +138,16 @@ class CPULiteAttention(nn.Module):
         query, key = apply_rotary_pos_emb(query, key, cos, sin)
 
         if past_key_value is not None:
-            key = torch.cat([past_key_value[0], key], dim=2)
-            value = torch.cat([past_key_value[1], value], dim=2)
+            if cache_position is not None:
+                # Optimized static KV cache update
+                past_key_value[0][:, :, cache_position] = key
+                past_key_value[1][:, :, cache_position] = value
+                key = past_key_value[0][:, :, :cache_position[-1] + 1]
+                value = past_key_value[1][:, :, :cache_position[-1] + 1]
+            else:
+                key = torch.cat([past_key_value[0], key], dim=2)
+                value = torch.cat([past_key_value[1], value], dim=2)
+        
         present = (key, value) if use_cache else None
 
         if self.num_kv_groups > 1:
@@ -150,26 +159,20 @@ class CPULiteAttention(nn.Module):
 
         kv_len = key_for_attn.size(-2)
         if self.use_sdpa and hasattr(F, "scaled_dot_product_attention"):
-            if attention_mask is None:
-                past_len = kv_len - q_len
-                q_pos = torch.arange(past_len, past_len + q_len, device=hidden_states.device)[:, None]
-                k_pos = torch.arange(kv_len, device=hidden_states.device)[None, :]
-                causal = k_pos <= q_pos
-                attention_mask = torch.zeros((q_len, kv_len), device=hidden_states.device, dtype=query.dtype)
-                attention_mask = attention_mask.masked_fill(
-                    ~causal, torch.finfo(query.dtype).min
-                )[None, None, :, :]
+            # When using cache_position, we can optimize the mask
             attn_output = F.scaled_dot_product_attention(
                 query,
                 key_for_attn,
                 value_for_attn,
                 attn_mask=attention_mask,
                 dropout_p=0.0,
-                is_causal=False,
+                is_causal=attention_mask is None and q_len > 1,
             )
         else:
             attn_weights = torch.matmul(query, key_for_attn.transpose(-2, -1)) / math.sqrt(self.head_dim)
-            if attention_mask is None:
+            if attention_mask is not None:
+                attn_weights = attn_weights + attention_mask
+            elif q_len > 1:
                 past_len = kv_len - q_len
                 q_pos = torch.arange(past_len, past_len + q_len, device=hidden_states.device)[:, None]
                 k_pos = torch.arange(kv_len, device=hidden_states.device)[None, :]
@@ -177,12 +180,13 @@ class CPULiteAttention(nn.Module):
                 attn_weights = attn_weights.masked_fill(
                     ~causal[None, None, :, :], torch.finfo(attn_weights.dtype).min
                 )
-            else:
-                attn_weights = attn_weights + attention_mask
+            
             attn_probs = F.softmax(attn_weights.float(), dim=-1).to(query.dtype)
             attn_output = torch.matmul(attn_probs, value_for_attn)
+        
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         return self.o_proj(attn_output), present
+
 
 
 class CPULiteMLP(nn.Module):
@@ -211,10 +215,16 @@ class CPULiteDecoderLayer(nn.Module):
         position_ids: torch.Tensor,
         past_key_value: Optional[PastKeyValue],
         use_cache: bool,
+        cache_position: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[PastKeyValue]]:
         residual = hidden_states
         attn_out, present = self.self_attn(
-            self.input_layernorm(hidden_states), attention_mask, position_ids, past_key_value, use_cache
+            self.input_layernorm(hidden_states),
+            attention_mask,
+            position_ids,
+            past_key_value,
+            use_cache,
+            cache_position,
         )
         hidden_states = residual + attn_out
         hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
@@ -250,6 +260,8 @@ class CPULiteModel(CPULitePreTrainedModel):
         device: torch.device,
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
+        if q_len <= 1 and attention_mask is None:
+            return None
         past_len = kv_len - q_len
         q_pos = torch.arange(past_len, past_len + q_len, device=device)[:, None]
         k_pos = torch.arange(kv_len, device=device)[None, :]
@@ -272,24 +284,51 @@ class CPULiteModel(CPULitePreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         past_key_values: Optional[List[PastKeyValue]] = None,
         use_cache: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[List[PastKeyValue]]]:
+        cache_position: Optional[torch.Tensor] = None,
+        early_exit_threshold: Optional[float] = None,
+        output_layer: Optional[int] = None,
+        return_hidden_states: bool = False,
+    ) -> Tuple[torch.Tensor, Optional[List[PastKeyValue]], Optional[int], Optional[List[torch.Tensor]]]:
         bsz, seq_len = input_ids.shape
-        past_len = 0 if past_key_values is None else past_key_values[0][0].size(2)
+        if cache_position is not None:
+            past_len = cache_position[0].item()
+        else:
+            past_len = 0 if past_key_values is None else past_key_values[0][0].size(2)
+
         if position_ids is None:
             position_ids = torch.arange(past_len, past_len + seq_len, device=input_ids.device).unsqueeze(0)
             position_ids = position_ids.expand(bsz, -1)
+
         hidden_states = self.embed_tokens(input_ids)
         kv_len = past_len + seq_len
         attn_mask = self._prepare_attention_mask(
             attention_mask, bsz, seq_len, kv_len, hidden_states.device, hidden_states.dtype
         )
+
         next_cache: List[PastKeyValue] = []
+        all_hidden_states = [] if return_hidden_states else None
+        actual_exit_layer = len(self.layers)
+
         for idx, layer in enumerate(self.layers):
+            if return_hidden_states:
+                all_hidden_states.append(hidden_states)
+
             past = None if past_key_values is None else past_key_values[idx]
-            hidden_states, present = layer(hidden_states, attn_mask, position_ids, past, use_cache)
+            hidden_states, present = layer(
+                hidden_states, attn_mask, position_ids, past, use_cache, cache_position
+            )
             if use_cache and present is not None:
                 next_cache.append(present)
-        return self.norm(hidden_states), next_cache if use_cache else None
+
+            if output_layer is not None and idx == output_layer:
+                actual_exit_layer = idx + 1
+                break
+
+        final_hidden = self.norm(hidden_states)
+        if return_hidden_states:
+            all_hidden_states.append(final_hidden)
+
+        return final_hidden, next_cache if use_cache else None, actual_exit_layer, all_hidden_states
 
 
 class CPULiteForCausalLM(CPULitePreTrainedModel):
@@ -302,6 +341,10 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
         else:
             self.apply(self._init_weights)
 
+    @property
+    def dtype(self) -> torch.dtype:
+        return next(self.parameters()).dtype
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -310,11 +353,24 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
         past_key_values: Optional[List[PastKeyValue]] = None,
         use_cache: bool = False,
         labels: Optional[torch.LongTensor] = None,
+        cache_position: Optional[torch.Tensor] = None,
+        output_layer: Optional[int] = None,
+        multi_exit_loss: bool = False,
     ) -> CPULiteCausalLMOutput:
-        hidden, cache = self.model(input_ids, attention_mask, position_ids, past_key_values, use_cache)
+        hidden, cache, _, all_hidden = self.model(
+            input_ids,
+            attention_mask,
+            position_ids,
+            past_key_values,
+            use_cache,
+            cache_position,
+            output_layer=output_layer,
+            return_hidden_states=multi_exit_loss,
+        )
         logits = self.lm_head(hidden)
         loss = None
         if labels is not None:
+            # Standard Loss
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
             loss = F.cross_entropy(
@@ -322,7 +378,26 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
+
+            # Multi-Exit Loss: Encourage intermediate layers to be useful
+            if multi_exit_loss and all_hidden is not None:
+                # We skip the embedding layer (index 0) and the final layer (already computed)
+                for i in range(1, len(all_hidden) - 1):
+                    # For CPULite, we use the same lm_head for all layers to save memory, 
+                    # but apply RMSNorm first as the layers' outputs aren't normalized.
+                    inter_hidden = self.model.norm(all_hidden[i])
+                    inter_logits = self.lm_head(inter_hidden)
+                    shift_inter_logits = inter_logits[:, :-1, :].contiguous()
+                    inter_loss = F.cross_entropy(
+                        shift_inter_logits.view(-1, self.config.vocab_size),
+                        shift_labels.view(-1),
+                        ignore_index=-100,
+                    )
+                    # We weight intermediate losses less
+                    loss = loss + 0.3 * inter_loss
+
         return CPULiteCausalLMOutput(loss=loss, logits=logits, past_key_values=cache)
+
 
     @torch.no_grad()
     def generate_simple(
@@ -337,12 +412,37 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
         self.eval()
         eos = self.config.eos_token_id if eos_token_id is None else eos_token_id
         generated = input_ids.clone()
+        device = input_ids.device
+        bsz = input_ids.size(0)
+        
         past = None
+        if use_cache:
+            max_len = generated.size(1) + max_new_tokens
+            past = []
+            for _ in range(self.config.num_hidden_layers):
+                k = torch.zeros(
+                    (bsz, self.config.num_key_value_heads, max_len, self.config.head_dim),
+                    device=device, dtype=self.dtype
+                )
+                v = torch.zeros(
+                    (bsz, self.config.num_key_value_heads, max_len, self.config.head_dim),
+                    device=device, dtype=self.dtype
+                )
+                past.append([k, v])
+        
+        cur_pos = 0
         next_input = generated
-        for _ in range(max_new_tokens):
-            out = self(next_input, past_key_values=past, use_cache=use_cache)
-            past = out.past_key_values if use_cache else None
+        
+        for i in range(max_new_tokens + 1):
+            cache_pos = torch.arange(cur_pos, cur_pos + next_input.size(1), device=device)
+            out = self(next_input, past_key_values=past, use_cache=use_cache, cache_position=cache_pos)
+            
+            if i == max_new_tokens:
+                break
+                
+            cur_pos += next_input.size(1)
             logits = out.logits[:, -1, :]
+            
             if temperature <= 0:
                 next_token = torch.argmax(logits, dim=-1, keepdim=True)
             else:
@@ -352,10 +452,13 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
                     logits = logits.masked_fill(logits < values[:, [-1]], -float("inf"))
                 probs = F.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
+            
             generated = torch.cat([generated, next_token], dim=1)
-            next_input = next_token if use_cache else generated
+            next_input = next_token
+            
             if eos is not None and bool((next_token == eos).all()):
                 break
+                
         return generated
 
     def save_pretrained(self, save_directory: str | Path, **kwargs: Any) -> None:
