@@ -108,6 +108,7 @@ class CPULiteAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.head_dim = config.head_dim
         self.num_kv_groups = self.num_heads // self.num_kv_heads
+        self.use_sdpa = getattr(config, "use_sdpa", True)
         self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(config.hidden_size, self.num_kv_heads * self.head_dim, bias=False)
@@ -147,18 +148,39 @@ class CPULiteAttention(nn.Module):
             key_for_attn = key
             value_for_attn = value
 
-        attn_weights = torch.matmul(query, key_for_attn.transpose(-2, -1)) / math.sqrt(self.head_dim)
         kv_len = key_for_attn.size(-2)
-        if attention_mask is None:
-            past_len = kv_len - q_len
-            q_pos = torch.arange(past_len, past_len + q_len, device=hidden_states.device)[:, None]
-            k_pos = torch.arange(kv_len, device=hidden_states.device)[None, :]
-            causal = k_pos <= q_pos
-            attn_weights = attn_weights.masked_fill(~causal[None, None, :, :], torch.finfo(attn_weights.dtype).min)
+        if self.use_sdpa and hasattr(F, "scaled_dot_product_attention"):
+            if attention_mask is None:
+                past_len = kv_len - q_len
+                q_pos = torch.arange(past_len, past_len + q_len, device=hidden_states.device)[:, None]
+                k_pos = torch.arange(kv_len, device=hidden_states.device)[None, :]
+                causal = k_pos <= q_pos
+                attention_mask = torch.zeros((q_len, kv_len), device=hidden_states.device, dtype=query.dtype)
+                attention_mask = attention_mask.masked_fill(
+                    ~causal, torch.finfo(query.dtype).min
+                )[None, None, :, :]
+            attn_output = F.scaled_dot_product_attention(
+                query,
+                key_for_attn,
+                value_for_attn,
+                attn_mask=attention_mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
         else:
-            attn_weights = attn_weights + attention_mask
-        attn_probs = F.softmax(attn_weights.float(), dim=-1).to(query.dtype)
-        attn_output = torch.matmul(attn_probs, value_for_attn)
+            attn_weights = torch.matmul(query, key_for_attn.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if attention_mask is None:
+                past_len = kv_len - q_len
+                q_pos = torch.arange(past_len, past_len + q_len, device=hidden_states.device)[:, None]
+                k_pos = torch.arange(kv_len, device=hidden_states.device)[None, :]
+                causal = k_pos <= q_pos
+                attn_weights = attn_weights.masked_fill(
+                    ~causal[None, None, :, :], torch.finfo(attn_weights.dtype).min
+                )
+            else:
+                attn_weights = attn_weights + attention_mask
+            attn_probs = F.softmax(attn_weights.float(), dim=-1).to(query.dtype)
+            attn_output = torch.matmul(attn_probs, value_for_attn)
         attn_output = attn_output.transpose(1, 2).reshape(bsz, q_len, self.hidden_size)
         return self.o_proj(attn_output), present
 

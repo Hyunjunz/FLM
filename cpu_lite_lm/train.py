@@ -49,6 +49,35 @@ def autocast_dtype(name: str) -> Optional[torch.dtype]:
     raise ValueError(f"Unsupported --amp-dtype {name}. Use off, fp16, or bf16.")
 
 
+@torch.no_grad()
+def evaluate_loss(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    device: torch.device,
+    amp_dtype: Optional[torch.dtype],
+    max_batches: int,
+) -> tuple[float, float]:
+    was_training = model.training
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
+    batches = 0
+    for batch in loader:
+        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+            out = model(**batch)
+        tokens = int(batch["attention_mask"].sum().item())
+        total_loss += float(out.loss.item()) * tokens
+        total_tokens += tokens
+        batches += 1
+        if max_batches > 0 and batches >= max_batches:
+            break
+    if was_training:
+        model.train()
+    mean_loss = total_loss / max(total_tokens, 1)
+    return mean_loss, math.exp(min(mean_loss, 20.0))
+
+
 def train(args: argparse.Namespace) -> Path:
     print(f"Training data: {args.data}", flush=True)
     torch.manual_seed(args.seed)
@@ -60,7 +89,11 @@ def train(args: argparse.Namespace) -> Path:
         print(f"CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
         print(f"TF32: {args.tf32}", flush=True)
     tokenizer_dir = Path(args.tokenizer)
+    print(f"Tokenizer arg: {tokenizer_dir}", flush=True)
+    print(f"Tokenizer path exists: {tokenizer_dir.exists()}", flush=True)
+    print(f"Tokenizer path is_dir: {tokenizer_dir.is_dir()}", flush=True)
     tokenizer_file = tokenizer_dir / "tokenizer.json" if tokenizer_dir.is_dir() else tokenizer_dir
+    print(f"Resolved tokenizer file: {tokenizer_file}", flush=True)
     if not tokenizer_file.exists():
         print(f"Tokenizer not found at {tokenizer_file}; starting tokenizer training.", flush=True)
         train_tokenizer(
@@ -73,9 +106,20 @@ def train(args: argparse.Namespace) -> Path:
         )
     else:
         print(f"Using tokenizer: {tokenizer_file}", flush=True)
+    print("Loading tokenizer...", flush=True)
     tokenizer = load_tokenizer(tokenizer_dir)
+    print(f"Loaded tokenizer vocab size: {tokenizer.get_vocab_size()}", flush=True)
+    print(f"Loading config: {args.config}", flush=True)
     config = CPULiteConfig.from_json_file(args.config)
     config.vocab_size = max(config.vocab_size, tokenizer.get_vocab_size())
+    print(
+        "Model config: "
+        f"layers={config.num_hidden_layers}, hidden={config.hidden_size}, "
+        f"heads={config.num_attention_heads}, kv_heads={config.num_key_value_heads}, "
+        f"vocab={config.vocab_size}",
+        flush=True,
+    )
+    print("Initializing model...", flush=True)
     model = CPULiteForCausalLM(config)
     if args.resume_from:
         resume_path = Path(args.resume_from)
@@ -84,7 +128,9 @@ def train(args: argparse.Namespace) -> Path:
             raise FileNotFoundError(f"Cannot resume. Missing checkpoint: {state_path}")
         model.load_state_dict(torch.load(state_path, map_location="cpu"))
         print(f"Resumed model weights from {resume_path}", flush=True)
+    print("Moving model to device...", flush=True)
     model.to(device)
+    print("Model is on device.", flush=True)
     if args.compile:
         if device.type != "cuda":
             print("Skipping torch.compile because the active device is not CUDA.", flush=True)
@@ -92,10 +138,13 @@ def train(args: argparse.Namespace) -> Path:
             model = torch.compile(model)  # type: ignore[assignment]
             print("Enabled torch.compile", flush=True)
     model.train()
+    print("Building dataset and dataloader...", flush=True)
     dataset_kwargs = dict(
         text_column=args.text_column,
         max_docs=args.max_docs,
         min_chars=args.min_chars,
+        skip_docs=args.skip_docs,
+        quality_filter=args.quality_filter,
         max_chars=args.max_chars,
     )
     if args.streaming:
@@ -117,6 +166,33 @@ def train(args: argparse.Namespace) -> Path:
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
     )
+    eval_loader = None
+    if args.eval_every > 0:
+        eval_data = args.eval_data or args.data
+        print(
+            f"Building validation loader from {eval_data} "
+            f"(docs={args.eval_docs}, max_chars={args.eval_max_chars})",
+            flush=True,
+        )
+        eval_dataset = TextCausalLMDataset(
+            eval_data,
+            tokenizer,
+            args.block_size,
+            text_column=args.text_column,
+            max_docs=args.eval_docs,
+            min_chars=args.min_chars,
+            skip_docs=args.eval_skip_docs,
+            quality_filter=args.quality_filter,
+            max_chars=args.eval_max_chars,
+        )
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=lambda b: collate_causal_lm(b, config.pad_token_id),
+            num_workers=0,
+            pin_memory=device.type == "cuda",
+        )
     optim = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -165,6 +241,14 @@ def train(args: argparse.Namespace) -> Path:
                     f"step {step}/{target} loss {mean_loss:.4f} ppl {ppl:.2f} tokens {eff_tokens}",
                     flush=True,
                 )
+            if eval_loader is not None and (step % args.eval_every == 0 or step == 1):
+                val_loss, val_ppl = evaluate_loss(
+                    model, eval_loader, device, amp_dtype, args.eval_max_batches
+                )
+                print(
+                    f"eval step {step}/{target} val_loss {val_loss:.4f} val_ppl {val_ppl:.2f}",
+                    flush=True,
+                )
             if args.save_every > 0 and step % args.save_every == 0:
                 output = Path(args.output_dir)
                 model_to_save = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -203,6 +287,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-column", default="text")
     parser.add_argument("--max-docs", type=parse_optional_int, default=2000)
     parser.add_argument("--min-chars", type=int, default=0)
+    parser.add_argument("--skip-docs", type=int, default=0)
+    parser.add_argument("--quality-filter", action="store_true")
     parser.add_argument("--max-chars", type=int, default=200_000)
     parser.add_argument("--tokenizer-max-docs", type=parse_optional_int, default=2000)
     parser.add_argument("--tokenizer-log-every", type=int, default=1000)
@@ -222,6 +308,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--beta2", type=float, default=0.95)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--resume-from", default="")
+    parser.add_argument("--eval-every", type=int, default=0)
+    parser.add_argument("--eval-data", default="")
+    parser.add_argument("--eval-docs", type=int, default=256)
+    parser.add_argument("--eval-skip-docs", type=int, default=0)
+    parser.add_argument("--eval-max-chars", type=int, default=200_000)
+    parser.add_argument("--eval-max-batches", type=int, default=20)
     return parser
 
 

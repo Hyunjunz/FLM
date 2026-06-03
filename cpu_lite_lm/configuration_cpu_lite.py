@@ -51,6 +51,7 @@ class CPULiteConfig(PretrainedConfig):
         rope_theta: float = 10000.0,
         rms_norm_eps: float = 1e-6,
         tie_word_embeddings: bool = True,
+        use_sdpa: bool = True,
         initializer_range: float = 0.02,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
@@ -74,6 +75,7 @@ class CPULiteConfig(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rms_norm_eps = rms_norm_eps
         self.tie_word_embeddings = tie_word_embeddings
+        self.use_sdpa = use_sdpa
         self.initializer_range = initializer_range
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
@@ -107,4 +109,3 @@ class CPULiteConfig(PretrainedConfig):
         data = super().to_dict()
         data["model_type"] = self.model_type
         return data
-

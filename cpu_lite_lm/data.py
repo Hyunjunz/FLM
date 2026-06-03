@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 import random
 from typing import Dict, Iterator, Optional
@@ -15,22 +16,36 @@ def iter_texts_from_path(
     text_column: str = "text",
     max_docs: Optional[int] = None,
     min_chars: int = 0,
+    skip_docs: int = 0,
+    quality_filter: bool = False,
 ) -> Iterator[str]:
     """Yield text records from a plain text file or HF datasets Arrow cache directory."""
     path = Path(data_path)
     yielded = 0
+    skipped = 0
 
     def allow_more() -> bool:
         return max_docs is None or yielded < max_docs
 
+    def should_yield(text: str) -> bool:
+        nonlocal skipped
+        if len(text) < min_chars:
+            return False
+        if quality_filter and not is_reasonable_webtext(text):
+            return False
+        if skipped < skip_docs:
+            skipped += 1
+            return False
+        return True
+
     if path.is_file():
         if path.suffix.lower() == ".arrow":
             for text in _iter_arrow_texts(path, text_column, max_docs):
-                if len(text) >= min_chars:
+                if should_yield(text):
                     yield text
         else:
             text = path.read_text(encoding="utf-8")
-            if text.strip() and len(text) >= min_chars:
+            if text.strip() and should_yield(text):
                 yield text
         return
 
@@ -43,7 +58,7 @@ def iter_texts_from_path(
             for text in _iter_arrow_texts(arrow_path, text_column, None):
                 if not allow_more():
                     return
-                if len(text) >= min_chars:
+                if should_yield(text):
                     yielded += 1
                     yield text
         return
@@ -58,8 +73,30 @@ def iter_texts_from_path(
             return
         yielded += 1
         text = text_path.read_text(encoding="utf-8")
-        if text.strip() and len(text) >= min_chars:
+        if text.strip() and should_yield(text):
             yield text
+
+
+def is_reasonable_webtext(text: str) -> bool:
+    """Cheap filters for noisy Korean webtext.
+
+    These filters intentionally avoid model-specific assumptions. They remove
+    very symbol-heavy, control-character-heavy, or extremely repetitive records.
+    """
+    stripped = text.strip()
+    if len(stripped) < 20:
+        return False
+    sample = stripped[:4000]
+    control = sum(1 for ch in sample if ord(ch) < 32 and ch not in "\n\t\r")
+    if control / max(len(sample), 1) > 0.01:
+        return False
+    alnum_or_ko = sum(1 for ch in sample if ch.isalnum() or ("가" <= ch <= "힣"))
+    if alnum_or_ko / max(len(sample), 1) < 0.35:
+        return False
+    top_char_count = max(Counter(sample).values()) if sample else 0
+    if top_char_count / max(len(sample), 1) > 0.30:
+        return False
+    return True
 
 
 def _iter_arrow_texts(
@@ -102,13 +139,20 @@ class TextCausalLMDataset(Dataset):
         text_column: str = "text",
         max_docs: Optional[int] = None,
         min_chars: int = 0,
+        skip_docs: int = 0,
+        quality_filter: bool = False,
         max_chars: int = 200_000,
     ) -> None:
         ids = []
         used_chars = 0
         eos_id = tokenizer.token_to_id("<eos>")
         for text in iter_texts_from_path(
-            data_path, text_column=text_column, max_docs=max_docs, min_chars=min_chars
+            data_path,
+            text_column=text_column,
+            max_docs=max_docs,
+            min_chars=min_chars,
+            skip_docs=skip_docs,
+            quality_filter=quality_filter,
         ):
             if max_chars > 0:
                 remaining = max_chars - used_chars
@@ -172,6 +216,8 @@ class StreamingTextCausalLMDataset(IterableDataset):
         text_column: str = "text",
         max_docs: Optional[int] = None,
         min_chars: int = 0,
+        skip_docs: int = 0,
+        quality_filter: bool = False,
         max_chars: int = 0,
         shuffle_buffer: int = 0,
         seed: int = 1234,
@@ -182,6 +228,8 @@ class StreamingTextCausalLMDataset(IterableDataset):
         self.text_column = text_column
         self.max_docs = max_docs
         self.min_chars = min_chars
+        self.skip_docs = skip_docs
+        self.quality_filter = quality_filter
         self.max_chars = max_chars
         self.shuffle_buffer = shuffle_buffer
         self.seed = seed
@@ -202,6 +250,8 @@ class StreamingTextCausalLMDataset(IterableDataset):
             text_column=self.text_column,
             max_docs=self.max_docs,
             min_chars=self.min_chars,
+            skip_docs=self.skip_docs,
+            quality_filter=self.quality_filter,
         ):
             if self.max_chars > 0:
                 remaining = self.max_chars - used_chars

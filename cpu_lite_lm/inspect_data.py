@@ -21,7 +21,12 @@ def inspect(args: argparse.Namespace) -> None:
     seen_prefixes = set()
 
     for text in iter_texts_from_path(
-        args.data, text_column=args.text_column, max_docs=args.max_docs, min_chars=args.min_chars
+        args.data,
+        text_column=args.text_column,
+        max_docs=args.max_docs,
+        min_chars=args.min_chars,
+        skip_docs=args.skip_docs,
+        quality_filter=args.quality_filter,
     ):
         docs += 1
         chars += len(text)
@@ -53,6 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--text-column", default="text")
     parser.add_argument("--max-docs", type=int, default=1000)
     parser.add_argument("--min-chars", type=int, default=0)
+    parser.add_argument("--skip-docs", type=int, default=0)
+    parser.add_argument("--quality-filter", action="store_true")
     parser.add_argument("--max-chars-per-doc", type=int, default=2000)
     parser.add_argument("--prefix-chars", type=int, default=120)
     parser.add_argument("--first-token-window", type=int, default=128)

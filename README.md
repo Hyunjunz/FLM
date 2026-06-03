@@ -108,6 +108,23 @@ the full dataset for model training. To force visible tokenizer progress:
 python -u scripts/train_colab_l4_fast.py --tokenizer-log-every 100
 ```
 
+For a better L4 run with validation loss and noisy-webtext filtering:
+
+```bash
+python -u scripts/train_colab_l4_quality.py
+```
+
+This preset uses `configs/colab_medium.json`, SDPA attention when available,
+quality filtering, a held-out validation prefix, and logs validation perplexity
+every 1000 optimizer steps. If it OOMs, reduce `--batch-size 16` to `8` and
+increase `--grad-accum-steps 2` to `4`.
+
+Useful diagnostics:
+
+```bash
+python scripts/inspect_korean_webtext.py --quality-filter --max-docs 1000
+```
+
 If you have a stronger GPU and enough time, try the larger config:
 
 ```bash
@@ -125,6 +142,39 @@ Generate from the Colab checkpoint:
 
 ```bash
 python scripts/generate_colab.py --prompt "대한민국의 수도는" --max_new_tokens 120
+```
+
+## Keural SFT
+
+To download `mkd-chanwoo/keural-SFT` and immediately run supervised fine-tuning:
+
+```bash
+python -u scripts/train_keural_sft.py \
+  --base-model artifacts/l4_quality_ckpt \
+  --tokenizer artifacts/tokenizer_colab_32k \
+  --config configs/colab_medium.json \
+  --output-dir artifacts/keural_sft_ckpt \
+  --max-steps 3000
+```
+
+`scripts/train_keural_sft.py` downloads automatically when
+`datasets/keural-SFT` is missing. The dataset cache goes to `./hf_cache`.
+
+Download only:
+
+```bash
+python scripts/download_keural_sft.py
+```
+
+Generate from the SFT checkpoint:
+
+```bash
+python scripts/generate_colab.py \
+  --model artifacts/keural_sft_ckpt \
+  --tokenizer artifacts/tokenizer_colab_32k \
+  --config configs/colab_medium.json \
+  --prompt "### 질문:\n대한민국의 수도는?\n\n### 답변:\n" \
+  --max_new_tokens 80
 ```
 
 The HF cache reader streams the Arrow shards and uses the `text` column by
@@ -207,9 +257,11 @@ Configs:
 
 ## Current Limits
 
-- This is a correctness-first Python/PyTorch implementation, not a fused-kernel
-  inference engine.
+- This is still a Python/PyTorch implementation, but it now uses PyTorch SDPA
+  attention when available.
 - The toy corpus is too small for meaningful language quality.
+- Korean webtext is noisy; use `--quality-filter` for long training runs.
+- Train loss alone is misleading; use `--eval-every` or the L4 quality preset.
 - ONNX export is a skeleton and does not yet export cache-aware generation.
 - GGUF conversion is documented as a future mapping task.
 

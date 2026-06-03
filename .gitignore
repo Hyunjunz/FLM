@@ -1,5 +1,7 @@
 # Local datasets and generated training outputs
 data/
+datasets/
+hf_cache/
 artifacts/
 checkpoints/
 runs/
@@ -42,4 +44,3 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
-
