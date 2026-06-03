@@ -382,19 +382,21 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
             # Multi-Exit Loss: Encourage intermediate layers to be useful
             if multi_exit_loss and all_hidden is not None:
                 # We skip the embedding layer (index 0) and the final layer (already computed)
-                for i in range(1, len(all_hidden) - 1):
-                    # For CPULite, we use the same lm_head for all layers to save memory, 
-                    # but apply RMSNorm first as the layers' outputs aren't normalized.
-                    inter_hidden = self.model.norm(all_hidden[i])
-                    inter_logits = self.lm_head(inter_hidden)
-                    shift_inter_logits = inter_logits[:, :-1, :].contiguous()
-                    inter_loss = F.cross_entropy(
-                        shift_inter_logits.view(-1, self.config.vocab_size),
-                        shift_labels.view(-1),
-                        ignore_index=-100,
-                    )
-                    # We weight intermediate losses less
-                    loss = loss + 0.3 * inter_loss
+                num_inter_layers = len(all_hidden) - 2
+                if num_inter_layers > 0:
+                    inter_loss_weight = 0.3 / num_inter_layers
+                    for i in range(1, len(all_hidden) - 1):
+                        inter_hidden = self.model.norm(all_hidden[i])
+                        inter_logits = self.lm_head(inter_hidden)
+                        shift_inter_logits = inter_logits[:, :-1, :].contiguous()
+                        inter_loss = F.cross_entropy(
+                            shift_inter_logits.view(-1, self.config.vocab_size),
+                            shift_labels.view(-1),
+                            ignore_index=-100,
+                        )
+                        loss = loss + inter_loss_weight * inter_loss
+                        # Force cleanup of intermediate tensors if possible
+                        del inter_hidden, inter_logits, shift_inter_logits
 
         return CPULiteCausalLMOutput(loss=loss, logits=logits, past_key_values=cache)
 
