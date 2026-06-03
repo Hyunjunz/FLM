@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpu-llm-lab"
+version = "0.1.0"
+description = "CPU-friendly mini decoder-only language model lab"
+requires-python = ">=3.10"
+dependencies = ["torch", "tokenizers", "psutil", "pyarrow"]
+
+[project.optional-dependencies]
+dev = ["pytest", "transformers", "datasets"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

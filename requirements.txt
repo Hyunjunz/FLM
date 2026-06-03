@@ -1,0 +1,7 @@
+torch
+tokenizers
+pytest
+psutil
+transformers
+pyarrow
+datasets
