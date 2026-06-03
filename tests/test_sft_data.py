@@ -1,31 +1,42 @@
-from cpu_lite_lm.sft_data import build_instruction_text, format_sft_example
+from cpu_lite_lm.sft_data import (
+    _is_preformatted_text_example,
+    build_instruction_text,
+    format_sft_example,
+)
 
 
 def test_format_instruction_output():
     prompt, answer = format_sft_example(
-        {"instruction": "수도를 답하세요.", "input": "대한민국", "output": "서울입니다."}
+        {"instruction": "Answer the capital.", "input": "Korea", "output": "Seoul."}
     )
-    assert "수도" in prompt
-    assert "대한민국" in prompt
-    assert answer == "서울입니다."
+    assert "capital" in prompt
+    assert "Korea" in prompt
+    assert answer == "Seoul."
 
 
 def test_format_messages():
     prompt, answer = format_sft_example(
         {
             "messages": [
-                {"role": "user", "content": "안녕?"},
-                {"role": "assistant", "content": "안녕하세요."},
+                {"role": "user", "content": "Hello?"},
+                {"role": "assistant", "content": "Hi."},
             ]
         }
     )
-    assert "안녕" in prompt
-    assert answer == "안녕하세요."
+    assert "Hello" in prompt
+    assert answer == "Hi."
 
 
 def test_instruction_template():
-    prompt, answer = build_instruction_text("질문", "답")
-    assert "### 질문:" in prompt
-    assert "### 답변:" in prompt
-    assert answer == "답"
+    prompt, answer = build_instruction_text("question", "answer")
+    assert "### Question:" in prompt
+    assert "### Answer:" in prompt
+    assert answer == "answer"
+
+
+def test_preformatted_text_schema():
+    assert _is_preformatted_text_example(
+        {"text": "### Question:\nA\n\n### Answer:\nB", "source_name": "x", "n_tokens": 10}
+    )
+    assert not _is_preformatted_text_example({"text": "x", "output": "y"})
 

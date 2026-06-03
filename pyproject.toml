@@ -7,7 +7,7 @@ name = "cpu-llm-lab"
 version = "0.1.0"
 description = "CPU-friendly mini decoder-only language model lab"
 requires-python = ">=3.10"
-dependencies = ["torch", "tokenizers", "psutil", "pyarrow"]
+dependencies = ["torch", "tokenizers", "psutil", "pyarrow", "huggingface_hub"]
 
 [project.optional-dependencies]
 dev = ["pytest", "transformers", "datasets"]

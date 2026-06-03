@@ -66,11 +66,29 @@ def _first_present(example: Dict[str, Any], keys: List[str]) -> str:
 
 def build_instruction_text(prompt: str, answer: str) -> tuple[str, str]:
     prompt_text = (
-        "### 질문:\n"
+        "### Question:\n"
         f"{prompt.strip()}\n\n"
-        "### 답변:\n"
+        "### Answer:\n"
     )
     return prompt_text, answer.strip()
+
+
+def _is_preformatted_text_example(example: Dict[str, Any]) -> bool:
+    if "text" not in example or not str(example.get("text") or "").strip():
+        return False
+    structured_keys = {
+        "messages",
+        "instruction",
+        "prompt",
+        "question",
+        "query",
+        "output",
+        "response",
+        "answer",
+        "completion",
+        "chosen",
+    }
+    return not any(key in example and str(example.get(key) or "").strip() for key in structured_keys)
 
 
 class SFTDataset(Dataset):
@@ -97,9 +115,22 @@ class SFTDataset(Dataset):
         return len(self.raw)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        prompt, answer = format_sft_example(dict(self.raw[idx]))
+        example = dict(self.raw[idx])
+        if _is_preformatted_text_example(example):
+            ids = self.tokenizer.encode(str(example["text"])).ids
+            if self.eos_id is not None:
+                ids.append(self.eos_id)
+            ids = ids[: self.block_size]
+            if len(ids) < 2:
+                ids = ids + [self.eos_id or 2]
+            return {
+                "input_ids": torch.tensor(ids, dtype=torch.long),
+                "labels": torch.tensor(ids, dtype=torch.long),
+            }
+
+        prompt, answer = format_sft_example(example)
         if not prompt or not answer:
-            prompt = prompt or "다음에 답하세요."
+            prompt = prompt or "Please answer the following."
             answer = answer or ""
         prompt_text, answer_text = build_instruction_text(prompt, answer)
         prompt_ids = self.tokenizer.encode(prompt_text).ids
@@ -127,3 +158,4 @@ class SFTDataset(Dataset):
             "input_ids": torch.tensor(ids, dtype=torch.long),
             "labels": torch.tensor(labels, dtype=torch.long),
         }
+

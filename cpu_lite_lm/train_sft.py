@@ -39,15 +39,51 @@ def ensure_sft_dataset(args: argparse.Namespace) -> None:
         f"split={args.download_split} cache_dir={args.cache_dir}",
         flush=True,
     )
-    ds = load_dataset(
-        args.dataset_name,
-        split=args.download_split,
-        cache_dir=args.cache_dir,
-    )
+    try:
+        ds = load_dataset(
+            args.dataset_name,
+            split=args.download_split,
+            cache_dir=args.cache_dir,
+        )
+    except Exception as exc:
+        print(
+            "Direct load_dataset failed. Falling back to shard_*.jsonl-only loading "
+            f"because the dataset repo contains mixed JSON schemas. Error: {exc}",
+            flush=True,
+        )
+        ds = load_jsonl_shards(args.dataset_name, args.cache_dir, args.download_split)
     print(f"First SFT example: {ds[0]}", flush=True)
     data_path.parent.mkdir(parents=True, exist_ok=True)
     ds.save_to_disk(str(data_path))
     print(f"Saved SFT dataset to {data_path}", flush=True)
+
+
+def load_jsonl_shards(dataset_name: str, cache_dir: str, split: str):
+    from datasets import load_dataset
+    from huggingface_hub import HfApi, hf_hub_download
+
+    api = HfApi()
+    files = api.list_repo_files(dataset_name, repo_type="dataset")
+    shard_files = sorted(
+        file for file in files if Path(file).name.startswith("shard_") and file.endswith(".jsonl")
+    )
+    if not shard_files:
+        raise FileNotFoundError(
+            f"No shard_*.jsonl files found in dataset repo {dataset_name}. Files: {files[:20]}"
+        )
+    print(f"Found {len(shard_files)} jsonl shards.", flush=True)
+    local_files = []
+    for idx, filename in enumerate(shard_files, start=1):
+        path = hf_hub_download(
+            repo_id=dataset_name,
+            repo_type="dataset",
+            filename=filename,
+            cache_dir=cache_dir,
+        )
+        local_files.append(path)
+        if idx == 1 or idx % 10 == 0 or idx == len(shard_files):
+            print(f"downloaded shard {idx}/{len(shard_files)}: {filename}", flush=True)
+    return load_dataset("json", data_files={split: local_files}, split=split, cache_dir=cache_dir)
 
 
 def train_sft(args: argparse.Namespace) -> Path:

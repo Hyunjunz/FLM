@@ -5,3 +5,4 @@ psutil
 transformers
 pyarrow
 datasets
+huggingface_hub
