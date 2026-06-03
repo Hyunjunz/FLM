@@ -94,6 +94,20 @@ For better quality, run longer:
 python scripts/train_colab_gpu.py --max-steps 50000 --save-every 5000
 ```
 
+If Colab shows no output for a long time, use unbuffered Python and the L4 fast
+preset:
+
+```bash
+python -u scripts/train_colab_l4_fast.py
+```
+
+This prints immediately, trains the tokenizer from 50K documents, then streams
+the full dataset for model training. To force visible tokenizer progress:
+
+```bash
+python -u scripts/train_colab_l4_fast.py --tokenizer-log-every 100
+```
+
 If you have a stronger GPU and enough time, try the larger config:
 
 ```bash

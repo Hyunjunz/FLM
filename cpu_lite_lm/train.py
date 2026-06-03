@@ -50,19 +50,29 @@ def autocast_dtype(name: str) -> Optional[torch.dtype]:
 
 
 def train(args: argparse.Namespace) -> Path:
-    print(f"Training data: {args.data}")
+    print(f"Training data: {args.data}", flush=True)
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
-    print(f"Device: {device}")
+    print(f"Device: {device}", flush=True)
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = args.tf32
         torch.backends.cudnn.allow_tf32 = args.tf32
-        print(f"CUDA device: {torch.cuda.get_device_name(0)}")
-        print(f"TF32: {args.tf32}")
+        print(f"CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
+        print(f"TF32: {args.tf32}", flush=True)
     tokenizer_dir = Path(args.tokenizer)
     tokenizer_file = tokenizer_dir / "tokenizer.json" if tokenizer_dir.is_dir() else tokenizer_dir
     if not tokenizer_file.exists():
-        train_tokenizer(args.data, tokenizer_dir, args.vocab_size, args.text_column, args.tokenizer_max_docs)
+        print(f"Tokenizer not found at {tokenizer_file}; starting tokenizer training.", flush=True)
+        train_tokenizer(
+            args.data,
+            tokenizer_dir,
+            args.vocab_size,
+            args.text_column,
+            args.tokenizer_max_docs,
+            args.tokenizer_log_every,
+        )
+    else:
+        print(f"Using tokenizer: {tokenizer_file}", flush=True)
     tokenizer = load_tokenizer(tokenizer_dir)
     config = CPULiteConfig.from_json_file(args.config)
     config.vocab_size = max(config.vocab_size, tokenizer.get_vocab_size())
@@ -73,14 +83,14 @@ def train(args: argparse.Namespace) -> Path:
         if not state_path.exists():
             raise FileNotFoundError(f"Cannot resume. Missing checkpoint: {state_path}")
         model.load_state_dict(torch.load(state_path, map_location="cpu"))
-        print(f"Resumed model weights from {resume_path}")
+        print(f"Resumed model weights from {resume_path}", flush=True)
     model.to(device)
     if args.compile:
         if device.type != "cuda":
-            print("Skipping torch.compile because the active device is not CUDA.")
+            print("Skipping torch.compile because the active device is not CUDA.", flush=True)
         else:
             model = torch.compile(model)  # type: ignore[assignment]
-            print("Enabled torch.compile")
+            print("Enabled torch.compile", flush=True)
     model.train()
     dataset_kwargs = dict(
         text_column=args.text_column,
@@ -120,6 +130,12 @@ def train(args: argparse.Namespace) -> Path:
     running_loss = 0.0
     target = "full epoch" if args.max_steps <= 0 else str(args.max_steps)
     optim.zero_grad(set_to_none=True)
+    print(
+        "Starting training loop "
+        f"(batch_size={args.batch_size}, block_size={args.block_size}, "
+        f"grad_accum_steps={args.grad_accum_steps}, streaming={args.streaming})",
+        flush=True,
+    )
     while args.max_steps <= 0 or step < args.max_steps:
         saw_batch = False
         for batch in loader:
@@ -145,7 +161,10 @@ def train(args: argparse.Namespace) -> Path:
                 ppl = math.exp(min(mean_loss, 20.0))
                 tokens = int(batch["attention_mask"].sum().item())
                 eff_tokens = tokens * args.grad_accum_steps
-                print(f"step {step}/{target} loss {mean_loss:.4f} ppl {ppl:.2f} tokens {eff_tokens}")
+                print(
+                    f"step {step}/{target} loss {mean_loss:.4f} ppl {ppl:.2f} tokens {eff_tokens}",
+                    flush=True,
+                )
             if args.save_every > 0 and step % args.save_every == 0:
                 output = Path(args.output_dir)
                 model_to_save = model._orig_mod if hasattr(model, "_orig_mod") else model
@@ -154,7 +173,7 @@ def train(args: argparse.Namespace) -> Path:
                 (output / "training_args.json").write_text(
                     json.dumps(vars(args), indent=2, default=str), encoding="utf-8"
                 )
-                print(f"Saved intermediate checkpoint to {output}")
+                print(f"Saved intermediate checkpoint to {output}", flush=True)
             if args.max_steps > 0 and step >= args.max_steps:
                 break
         if args.max_steps <= 0 or not saw_batch:
@@ -166,7 +185,7 @@ def train(args: argparse.Namespace) -> Path:
     (output / "training_args.json").write_text(
         json.dumps(vars(args), indent=2, default=str), encoding="utf-8"
     )
-    print(f"Saved checkpoint to {output}")
+    print(f"Saved checkpoint to {output}", flush=True)
     return output
 
 
@@ -186,6 +205,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-chars", type=int, default=0)
     parser.add_argument("--max-chars", type=int, default=200_000)
     parser.add_argument("--tokenizer-max-docs", type=parse_optional_int, default=2000)
+    parser.add_argument("--tokenizer-log-every", type=int, default=1000)
     parser.add_argument("--streaming", action="store_true")
     parser.add_argument("--shuffle-buffer", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1234)

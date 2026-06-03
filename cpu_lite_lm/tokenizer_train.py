@@ -29,6 +29,7 @@ def train_tokenizer(
     vocab_size: int = 1024,
     text_column: str = "text",
     max_docs: int | None = 2000,
+    log_every: int = 1000,
 ) -> Path:
     data_path = Path(data_path)
     output_dir = Path(output_dir)
@@ -42,10 +43,24 @@ def train_tokenizer(
         special_tokens=SPECIAL_TOKENS,
         show_progress=False,
     )
+    print(
+        f"Training tokenizer from {data_path} "
+        f"(vocab_size={vocab_size}, max_docs={max_docs})",
+        flush=True,
+    )
     if data_path.is_file() and data_path.suffix.lower() not in {".arrow"}:
         tokenizer.train([str(data_path)], trainer)
     else:
-        iterator = iter_texts_from_path(data_path, text_column=text_column, max_docs=max_docs)
+        def logging_iterator():
+            for idx, text in enumerate(
+                iter_texts_from_path(data_path, text_column=text_column, max_docs=max_docs),
+                start=1,
+            ):
+                if log_every > 0 and idx % log_every == 0:
+                    print(f"tokenizer docs read: {idx}", flush=True)
+                yield text
+
+        iterator = logging_iterator()
         tokenizer.train_from_iterator(iterator, trainer=trainer, length=max_docs)
     tokenizer.post_processor = TemplateProcessing(
         single="<bos> $A <eos>",
@@ -54,6 +69,7 @@ def train_tokenizer(
     )
     path = output_dir / "tokenizer.json"
     tokenizer.save(str(path))
+    print(f"Tokenizer vocab size: {tokenizer.get_vocab_size()}", flush=True)
     return path
 
 
@@ -73,8 +89,16 @@ def main() -> None:
     parser.add_argument("--vocab-size", type=int, default=1024)
     parser.add_argument("--text-column", default="text")
     parser.add_argument("--max-docs", type=int, default=2000)
+    parser.add_argument("--log-every", type=int, default=1000)
     args = parser.parse_args()
-    path = train_tokenizer(args.data, args.output_dir, args.vocab_size, args.text_column, args.max_docs)
+    path = train_tokenizer(
+        args.data,
+        args.output_dir,
+        args.vocab_size,
+        args.text_column,
+        args.max_docs,
+        args.log_every,
+    )
     print(f"Saved tokenizer to {path}")
 
 
