@@ -92,6 +92,10 @@ def train_sft(args: argparse.Namespace) -> Path:
     ensure_sft_dataset(args)
     device = resolve_device(args.device)
     torch.manual_seed(args.seed)
+    if args.cpu_threads > 0:
+        torch.set_num_threads(args.cpu_threads)
+        torch.set_num_interop_threads(max(1, min(2, args.cpu_threads)))
+        print(f"CPU threads: {args.cpu_threads}", flush=True)
     print(f"SFT data: {args.data}", flush=True)
     print(f"Device: {device}", flush=True)
     if device.type == "cuda":
@@ -180,6 +184,7 @@ def train_sft(args: argparse.Namespace) -> Path:
         lr=args.learning_rate,
         betas=(0.9, 0.95),
         weight_decay=args.weight_decay,
+        foreach=args.foreach_optimizer,
     )
     amp_dtype = autocast_dtype(args.amp_dtype)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and amp_dtype == torch.float16)
@@ -277,6 +282,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amp-dtype", choices=["off", "fp16", "bf16"], default="fp16")
     parser.add_argument("--tf32", action="store_true")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--foreach-optimizer", action="store_true")
+    parser.add_argument("--cpu-threads", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--log-every", type=int, default=20)

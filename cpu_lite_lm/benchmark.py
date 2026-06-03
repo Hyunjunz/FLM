@@ -19,18 +19,39 @@ def rss_mb() -> float:
 def benchmark(args: argparse.Namespace) -> None:
     if args.threads > 0:
         torch.set_num_threads(args.threads)
+        torch.set_num_interop_threads(max(1, min(2, args.threads)))
     model = load_model(args.model, args.config).eval()
     input_ids = torch.randint(4, model.config.vocab_size, (1, args.prompt_tokens), dtype=torch.long)
-    with torch.no_grad():
+    max_len = args.prompt_tokens + args.generated_tokens
+    past = model.allocate_kv_cache(1, max_len) if args.use_cache else None
+    generated = torch.empty((1, max_len), dtype=torch.long)
+    generated[:, : args.prompt_tokens] = input_ids
+    out_len = args.prompt_tokens
+
+    with torch.inference_mode():
         t0 = time.perf_counter()
-        out = model(input_ids, use_cache=args.use_cache)
+        out = model(
+            input_ids,
+            past_key_values=past,
+            use_cache=args.use_cache,
+            cache_position=torch.arange(args.prompt_tokens) if args.use_cache else None,
+            logits_to_keep=1,
+        )
         t1 = time.perf_counter()
-        past = out.past_key_values
-        token = input_ids[:, -1:]
+        token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
         t2 = time.perf_counter()
         for _ in range(args.generated_tokens):
-            out = model(token, past_key_values=past, use_cache=args.use_cache)
-            past = out.past_key_values
+            generated[:, out_len : out_len + 1] = token
+            out_len += 1
+            model_input = token if args.use_cache else generated[:, :out_len]
+            cache_position = torch.tensor([out_len - 1]) if args.use_cache else None
+            out = model(
+                model_input,
+                past_key_values=past,
+                use_cache=args.use_cache,
+                cache_position=cache_position,
+                logits_to_keep=1,
+            )
             token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
         t3 = time.perf_counter()
     prefill = args.prompt_tokens / max(t1 - t0, 1e-9)
@@ -63,4 +84,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

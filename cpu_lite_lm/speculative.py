@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F
-from typing import List, Optional, Tuple
-from .modeling_cpu_lite import CPULiteForCausalLM, PastKeyValue
+
+from .modeling_cpu_lite import CPULiteForCausalLM
 
 class SelfSpeculativeGenerator:
     def __init__(
@@ -19,14 +21,14 @@ class SelfSpeculativeGenerator:
         self.lookahead = lookahead
 
     @torch.no_grad()
-    def generate(
+    def generate_streaming(
         self,
         input_ids: torch.LongTensor,
         max_new_tokens: int = 32,
         temperature: float = 1.0,
         top_k: int = 0,
         eos_token_id: Optional[int] = None,
-    ) -> torch.LongTensor:
+    ):
         self.model.eval()
         device = input_ids.device
         bsz = input_ids.size(0)
@@ -34,23 +36,11 @@ class SelfSpeculativeGenerator:
         
         generated = input_ids.clone()
         
-        # Initialize KV Cache
-        # We need a full KV cache for the model
-        # Shape: (num_layers, 2 (K, V), bsz, num_heads, max_len, head_dim)
         max_len = generated.size(1) + max_new_tokens + self.lookahead + 1
-        kv_cache: List[List[torch.Tensor]] = []
-        for _ in range(self.model.config.num_hidden_layers):
-            k = torch.zeros(
-                (bsz, self.model.config.num_key_value_heads, max_len, self.model.config.head_dim),
-                device=device, dtype=self.model.dtype
-            )
-            v = torch.zeros(
-                (bsz, self.model.config.num_key_value_heads, max_len, self.model.config.head_dim),
-                device=device, dtype=self.model.dtype
-            )
-            kv_cache.append([k, v])
+        kv_cache = self.model.allocate_kv_cache(bsz, max_len, device=device)
             
         cur_pos = generated.size(1)
+        target_len = input_ids.size(1) + max_new_tokens
         # Initial prefill
         self.model(
             generated, 
@@ -59,11 +49,10 @@ class SelfSpeculativeGenerator:
             cache_position=torch.arange(0, cur_pos, device=device)
         )
         
-        while generated.size(1) < input_ids.size(1) + max_new_tokens:
+        while generated.size(1) < target_len:
             # 1. Draft phase: predict 'lookahead' tokens using early exit
             draft_ids = generated[:, -1:]
             draft_tokens = []
-            draft_kv_snapshot = [(k[:, :, :cur_pos].clone(), v[:, :, :cur_pos].clone()) for k, v in kv_cache]
             
             temp_pos = cur_pos
             for _ in range(self.lookahead):
@@ -79,6 +68,9 @@ class SelfSpeculativeGenerator:
                     next_token = torch.argmax(logits, dim=-1, keepdim=True)
                 else:
                     logits = logits / temperature
+                    if top_k and top_k > 0:
+                        values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                        logits = logits.masked_fill(logits < values[:, [-1]], -float("inf"))
                     probs = F.softmax(logits, dim=-1)
                     next_token = torch.multinomial(probs, num_samples=1)
                 
@@ -93,10 +85,6 @@ class SelfSpeculativeGenerator:
                 
             # 2. Verify phase
             all_draft_tokens = torch.cat(draft_tokens, dim=1)
-            for i in range(len(kv_cache)):
-                kv_cache[i][0][:, :, :cur_pos] = draft_kv_snapshot[i][0]
-                kv_cache[i][1][:, :, :cur_pos] = draft_kv_snapshot[i][1]
-            
             verify_input = torch.cat([generated[:, -1:], all_draft_tokens], dim=1)
             verify_pos = torch.arange(cur_pos - 1, cur_pos + all_draft_tokens.size(1), device=device)
             
@@ -121,10 +109,21 @@ class SelfSpeculativeGenerator:
             # Append accepted tokens + the first correction token
             if accepted_count < all_draft_tokens.size(1):
                 next_token = torch.argmax(verify_logits[:, accepted_count, :], dim=-1, keepdim=True)
-                generated = torch.cat([generated, all_draft_tokens[:, :accepted_count], next_token], dim=1)
+                accepted_slice = all_draft_tokens[:, :accepted_count]
+                chunks = [accepted_slice, next_token]
             else:
                 next_token = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
-                generated = torch.cat([generated, all_draft_tokens, next_token], dim=1)
+                chunks = [all_draft_tokens, next_token]
+
+            for chunk in chunks:
+                remaining = target_len - generated.size(1)
+                if remaining <= 0:
+                    break
+                chunk = chunk[:, :remaining]
+                if chunk.size(1) == 0:
+                    continue
+                generated = torch.cat([generated, chunk], dim=1)
+                yield chunk
             
             # Update position
             cur_pos = generated.size(1)
@@ -135,5 +134,3 @@ class SelfSpeculativeGenerator:
             
             if eos is not None and (generated[:, -1] == eos).any():
                 break
-                
-        return generated

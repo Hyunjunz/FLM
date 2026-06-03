@@ -140,8 +140,9 @@ class CPULiteAttention(nn.Module):
         if past_key_value is not None:
             if cache_position is not None:
                 # Optimized static KV cache update
-                past_key_value[0][:, :, cache_position] = key
-                past_key_value[1][:, :, cache_position] = value
+                # Use .to() to ensure dtype matches even with autocast
+                past_key_value[0][:, :, cache_position] = key.to(past_key_value[0].dtype)
+                past_key_value[1][:, :, cache_position] = value.to(past_key_value[1].dtype)
                 key = past_key_value[0][:, :, :cache_position[-1] + 1]
                 value = past_key_value[1][:, :, :cache_position[-1] + 1]
             else:
@@ -345,6 +346,41 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
     def dtype(self) -> torch.dtype:
         return next(self.parameters()).dtype
 
+    def allocate_kv_cache(
+        self,
+        batch_size: int,
+        max_length: int,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> List[List[torch.Tensor]]:
+        cache_device = device if device is not None else next(self.parameters()).device
+        cache_dtype = dtype if dtype is not None else self.dtype
+        return [
+            [
+                torch.zeros(
+                    (
+                        batch_size,
+                        self.config.num_key_value_heads,
+                        max_length,
+                        self.config.head_dim,
+                    ),
+                    device=cache_device,
+                    dtype=cache_dtype,
+                ),
+                torch.zeros(
+                    (
+                        batch_size,
+                        self.config.num_key_value_heads,
+                        max_length,
+                        self.config.head_dim,
+                    ),
+                    device=cache_device,
+                    dtype=cache_dtype,
+                ),
+            ]
+            for _ in range(self.config.num_hidden_layers)
+        ]
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -356,6 +392,7 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
         cache_position: Optional[torch.Tensor] = None,
         output_layer: Optional[int] = None,
         multi_exit_loss: bool = False,
+        logits_to_keep: int = 0,
     ) -> CPULiteCausalLMOutput:
         hidden, cache, _, all_hidden = self.model(
             input_ids,
@@ -367,9 +404,12 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
             output_layer=output_layer,
             return_hidden_states=multi_exit_loss,
         )
-        logits = self.lm_head(hidden)
+        logits_hidden = hidden[:, -logits_to_keep:, :] if logits_to_keep > 0 else hidden
+        logits = self.lm_head(logits_hidden)
         loss = None
         if labels is not None:
+            if logits_to_keep > 0:
+                raise ValueError("logits_to_keep cannot be used when labels are provided.")
             # Standard Loss
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
@@ -413,36 +453,32 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
     ) -> torch.LongTensor:
         self.eval()
         eos = self.config.eos_token_id if eos_token_id is None else eos_token_id
-        generated = input_ids.clone()
         device = input_ids.device
         bsz = input_ids.size(0)
+        prompt_len = input_ids.size(1)
+        max_len = prompt_len + max_new_tokens
+        generated = torch.empty((bsz, max_len), dtype=input_ids.dtype, device=device)
+        generated[:, :prompt_len] = input_ids
         
         past = None
         if use_cache:
-            max_len = generated.size(1) + max_new_tokens
-            past = []
-            for _ in range(self.config.num_hidden_layers):
-                k = torch.zeros(
-                    (bsz, self.config.num_key_value_heads, max_len, self.config.head_dim),
-                    device=device, dtype=self.dtype
-                )
-                v = torch.zeros(
-                    (bsz, self.config.num_key_value_heads, max_len, self.config.head_dim),
-                    device=device, dtype=self.dtype
-                )
-                past.append([k, v])
+            past = self.allocate_kv_cache(bsz, max_len, device=device)
         
         cur_pos = 0
-        next_input = generated
+        out_len = prompt_len
+        next_input = input_ids
         
-        for i in range(max_new_tokens + 1):
-            cache_pos = torch.arange(cur_pos, cur_pos + next_input.size(1), device=device)
-            out = self(next_input, past_key_values=past, use_cache=use_cache, cache_position=cache_pos)
-            
-            if i == max_new_tokens:
-                break
-                
-            cur_pos += next_input.size(1)
+        for _ in range(max_new_tokens):
+            model_input = next_input if use_cache else generated[:, :out_len]
+            cache_pos = torch.arange(cur_pos, cur_pos + model_input.size(1), device=device)
+            out = self(
+                model_input,
+                past_key_values=past,
+                use_cache=use_cache,
+                cache_position=cache_pos if use_cache else None,
+                logits_to_keep=1,
+            )
+            cur_pos += model_input.size(1) if use_cache else 0
             logits = out.logits[:, -1, :]
             
             if temperature <= 0:
@@ -455,13 +491,70 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
                 probs = F.softmax(logits, dim=-1)
                 next_token = torch.multinomial(probs, num_samples=1)
             
-            generated = torch.cat([generated, next_token], dim=1)
+            generated[:, out_len : out_len + 1] = next_token
+            out_len += 1
             next_input = next_token
             
             if eos is not None and bool((next_token == eos).all()):
                 break
                 
-        return generated
+        return generated[:, :out_len]
+
+    @torch.no_grad()
+    def generate_streaming(
+        self,
+        input_ids: torch.LongTensor,
+        max_new_tokens: int = 32,
+        temperature: float = 1.0,
+        top_k: int = 0,
+        use_cache: bool = True,
+        eos_token_id: Optional[int] = None,
+    ):
+        self.eval()
+        eos = self.config.eos_token_id if eos_token_id is None else eos_token_id
+        device = input_ids.device
+        bsz = input_ids.size(0)
+        
+        past = None
+        if use_cache:
+            max_len = input_ids.size(1) + max_new_tokens
+            past = self.allocate_kv_cache(bsz, max_len, device=device)
+        
+        cur_pos = 0
+        next_input = input_ids
+        emitted: List[torch.Tensor] = []
+        
+        for i in range(max_new_tokens):
+            model_input = next_input if use_cache else input_ids if i == 0 else torch.cat([input_ids, *emitted], dim=1)
+            cache_pos = torch.arange(cur_pos, cur_pos + model_input.size(1), device=device)
+            out = self(
+                model_input,
+                past_key_values=past,
+                use_cache=use_cache,
+                cache_position=cache_pos if use_cache else None,
+                logits_to_keep=1,
+            )
+            
+            cur_pos += model_input.size(1) if use_cache else 0
+            logits = out.logits[:, -1, :]
+            
+            if temperature <= 0:
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)
+            else:
+                logits = logits / temperature
+                if top_k and top_k > 0:
+                    values, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                    logits = logits.masked_fill(logits < values[:, [-1]], -float("inf"))
+                probs = F.softmax(logits, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)
+            
+            yield next_token
+            
+            next_input = next_token
+            if not use_cache:
+                emitted.append(next_token)
+            if eos is not None and bool((next_token == eos).all()):
+                break
 
     def save_pretrained(self, save_directory: str | Path, **kwargs: Any) -> None:
         save_path = Path(save_directory)

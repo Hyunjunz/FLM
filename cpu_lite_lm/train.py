@@ -82,6 +82,10 @@ def train(args: argparse.Namespace) -> Path:
     print(f"Training data: {args.data}", flush=True)
     torch.manual_seed(args.seed)
     device = resolve_device(args.device)
+    if args.cpu_threads > 0:
+        torch.set_num_threads(args.cpu_threads)
+        torch.set_num_interop_threads(max(1, min(2, args.cpu_threads)))
+        print(f"CPU threads: {args.cpu_threads}", flush=True)
     print(f"Device: {device}", flush=True)
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = args.tf32
@@ -198,6 +202,7 @@ def train(args: argparse.Namespace) -> Path:
         lr=args.learning_rate,
         betas=(args.beta1, args.beta2),
         weight_decay=args.weight_decay,
+        foreach=args.foreach_optimizer,
     )
     amp_dtype = autocast_dtype(args.amp_dtype)
     scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and amp_dtype == torch.float16)
@@ -306,6 +311,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--beta1", type=float, default=0.9)
     parser.add_argument("--beta2", type=float, default=0.95)
+    parser.add_argument("--foreach-optimizer", action="store_true")
+    parser.add_argument("--cpu-threads", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--resume-from", default="")
     parser.add_argument("--eval-every", type=int, default=0)
