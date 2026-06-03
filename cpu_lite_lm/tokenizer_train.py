@@ -51,6 +51,14 @@ def train_tokenizer(
     if data_path.is_file() and data_path.suffix.lower() not in {".arrow"}:
         tokenizer.train([str(data_path)], trainer)
     else:
+        if (data_path / "dataset_info.json").exists() or (data_path / "state.json").exists():
+            iterator = iter_texts_from_saved_dataset(data_path, text_column, max_docs, log_every)
+            tokenizer.train_from_iterator(iterator, trainer=trainer, length=max_docs)
+            path = output_dir / "tokenizer.json"
+            tokenizer.save(str(path))
+            print(f"Tokenizer vocab size: {tokenizer.get_vocab_size()}", flush=True)
+            return path
+
         def logging_iterator():
             for idx, text in enumerate(
                 iter_texts_from_path(data_path, text_column=text_column, max_docs=max_docs),
@@ -71,6 +79,41 @@ def train_tokenizer(
     tokenizer.save(str(path))
     print(f"Tokenizer vocab size: {tokenizer.get_vocab_size()}", flush=True)
     return path
+
+
+def iter_texts_from_saved_dataset(
+    data_path: Path,
+    text_column: str = "text",
+    max_docs: int | None = None,
+    log_every: int = 1000,
+):
+    try:
+        from datasets import load_from_disk
+    except Exception as exc:  # pragma: no cover
+        raise RuntimeError("Reading a saved HF dataset requires datasets.") from exc
+
+    ds = load_from_disk(str(data_path))
+    if hasattr(ds, "keys"):
+        ds = ds["train"]
+    limit = len(ds) if max_docs is None else min(max_docs, len(ds))
+    formatter = None
+    if text_column not in ds.column_names:
+        from .sft_data import build_instruction_text, format_sft_example
+
+        formatter = (format_sft_example, build_instruction_text)
+    for idx in range(limit):
+        if log_every > 0 and (idx + 1) % log_every == 0:
+            print(f"tokenizer docs read: {idx + 1}", flush=True)
+        row = dict(ds[idx])
+        if formatter is None:
+            value = row[text_column]
+        else:
+            format_sft_example, build_instruction_text = formatter
+            prompt, answer = format_sft_example(row)
+            prompt_text, answer_text = build_instruction_text(prompt, answer)
+            value = prompt_text + answer_text
+        if isinstance(value, str) and value.strip():
+            yield value
 
 
 def load_tokenizer(path: str | Path) -> Tokenizer:

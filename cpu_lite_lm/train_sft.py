@@ -15,7 +15,7 @@ from .configuration_cpu_lite import CPULiteConfig
 from .data import collate_causal_lm
 from .modeling_cpu_lite import CPULiteForCausalLM
 from .sft_data import SFTDataset
-from .tokenizer_train import load_tokenizer
+from .tokenizer_train import load_tokenizer, train_tokenizer
 from .train import autocast_dtype, evaluate_loss, resolve_device
 
 
@@ -99,12 +99,38 @@ def train_sft(args: argparse.Namespace) -> Path:
         torch.backends.cudnn.allow_tf32 = args.tf32
         print(f"CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
 
+    tokenizer_path = Path(args.tokenizer)
+    tokenizer_file = tokenizer_path / "tokenizer.json" if tokenizer_path.is_dir() else tokenizer_path
+    if not tokenizer_file.exists():
+        if not args.train_tokenizer_if_missing:
+            raise FileNotFoundError(
+                f"Tokenizer file not found: {tokenizer_file}. "
+                "Pass --train-tokenizer-if-missing or provide --tokenizer."
+            )
+        print(
+            f"Tokenizer not found at {tokenizer_file}; training tokenizer from SFT data.",
+            flush=True,
+        )
+        train_tokenizer(
+            args.data,
+            args.tokenizer,
+            args.vocab_size,
+            args.text_column,
+            args.tokenizer_max_docs,
+            args.tokenizer_log_every,
+        )
     tokenizer = load_tokenizer(args.tokenizer)
     if args.base_model and (Path(args.base_model) / "pytorch_model.bin").exists():
         print(f"Loading base model: {args.base_model}", flush=True)
         model = CPULiteForCausalLM.from_pretrained(args.base_model)
     else:
-        print(f"Initializing model from config: {args.config}", flush=True)
+        if args.base_model and args.base_model.lower() not in {"none", "random", ""}:
+            print(
+                f"Base model not found at {args.base_model}; initializing from config instead.",
+                flush=True,
+            )
+        else:
+            print(f"Initializing model from config: {args.config}", flush=True)
         config = CPULiteConfig.from_json_file(args.config)
         config.vocab_size = max(config.vocab_size, tokenizer.get_vocab_size())
         model = CPULiteForCausalLM(config)
@@ -229,6 +255,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--base-model", default="artifacts/l4_quality_ckpt")
     parser.add_argument("--config", default="configs/colab_medium.json")
     parser.add_argument("--tokenizer", default="artifacts/tokenizer_colab_32k")
+    parser.add_argument("--vocab-size", type=int, default=32000)
+    parser.add_argument("--text-column", default="text")
+    parser.add_argument("--train-tokenizer-if-missing", action="store_true")
+    parser.add_argument("--tokenizer-max-docs", type=int, default=200000)
+    parser.add_argument("--tokenizer-log-every", type=int, default=1000)
     parser.add_argument("--output-dir", default="artifacts/keural_sft_ckpt")
     parser.add_argument("--block-size", type=int, default=768)
     parser.add_argument("--batch-size", type=int, default=8)

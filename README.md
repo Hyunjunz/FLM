@@ -150,15 +150,25 @@ To download `mkd-chanwoo/keural-SFT` and immediately run supervised fine-tuning:
 
 ```bash
 python -u scripts/train_keural_sft.py \
-  --base-model artifacts/l4_quality_ckpt \
-  --tokenizer artifacts/tokenizer_colab_32k \
   --config configs/colab_medium.json \
   --output-dir artifacts/keural_sft_ckpt \
   --max-steps 3000
 ```
 
 `scripts/train_keural_sft.py` downloads automatically when
-`datasets/keural-SFT` is missing. The dataset cache goes to `./hf_cache`.
+`datasets/keural-SFT` is missing. If the tokenizer is missing, it trains one
+from the SFT `text` column. If `--base-model` is missing or `none`, it
+initializes from config. The dataset cache goes to `./hf_cache`.
+
+To SFT an existing pretraining checkpoint, pass it explicitly:
+
+```bash
+python -u scripts/train_keural_sft.py \
+  --base-model artifacts/l4_quality_ckpt \
+  --tokenizer artifacts/l4_quality_ckpt \
+  --output-dir artifacts/keural_sft_ckpt \
+  --max-steps 3000
+```
 
 Download only:
 
@@ -171,7 +181,7 @@ Generate from the SFT checkpoint:
 ```bash
 python scripts/generate_colab.py \
   --model artifacts/keural_sft_ckpt \
-  --tokenizer artifacts/tokenizer_colab_32k \
+  --tokenizer artifacts/keural_sft_ckpt \
   --config configs/colab_medium.json \
   --prompt "### 질문:\n대한민국의 수도는?\n\n### 답변:\n" \
   --max_new_tokens 80
