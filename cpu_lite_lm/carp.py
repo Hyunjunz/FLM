@@ -187,15 +187,16 @@ class ReasoningCompressor:
 
     category_slots = {
         "math": 0,
-        "code": 16,
-        "logic": 32,
-        "retrieval": 48,
-        "writing": 64,
-        "safety": 80,
-        "uncertainty": 96,
+        "code": 32,
+        "logic": 64,
+        "retrieval": 96,
+        "writing": 128,
+        "safety": 160,
+        "uncertainty": 192,
+        "korean": 224,
     }
 
-    def __init__(self, tokenizer, num_reasoning_tokens: int = 128) -> None:
+    def __init__(self, tokenizer, num_reasoning_tokens: int = 256) -> None:
         self.tokenizer = tokenizer
         self.num_reasoning_tokens = max(0, num_reasoning_tokens)
 
@@ -208,7 +209,7 @@ class ReasoningCompressor:
         tokens: List[str] = []
         for idx in range(budget):
             category = categories[idx % len(categories)]
-            base = self.category_slots[category]
+            base = self.category_slots.get(category, 64)  # Default to logic
             token_id = (base + idx) % self.num_reasoning_tokens
             token = f"{REASONING_TOKEN_PREFIX}{token_id}>"
             if self.tokenizer.token_to_id(token) is not None:
@@ -225,6 +226,10 @@ class ReasoningCompressor:
 
     def _categories(self, lowered: str, route: RouteDecision) -> List[str]:
         categories: List[str] = []
+        # Check for Korean first to include korean slot
+        if any("\uac00" <= char <= "\ud7a3" for char in lowered):
+            categories.append("korean")
+        
         if any(word in lowered for word in ("수학", "계산", "방정식", "math")):
             categories.append("math")
         if any(word in lowered for word in ("코드", "버그", "deadlock", "함수", "class", "python")):
@@ -237,6 +242,7 @@ class ReasoningCompressor:
             categories.append("writing")
         if route.difficulty_level == DifficultyLevel.CRITICAL:
             categories.extend(["safety", "uncertainty"])
+        
         if not categories:
             categories.append("logic" if route.difficulty_level >= DifficultyLevel.HARD else "writing")
         return categories

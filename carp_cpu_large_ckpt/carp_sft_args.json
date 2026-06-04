@@ -1,0 +1,19 @@
+{
+  "data": "data/carp_language_mix_train.jsonl",
+  "config": "configs/carp_cpu_large.json",
+  "tokenizer": "artifacts/tokenizer_rtx4090_32k",
+  "output_dir": "artifacts/carp_cpu_large_ckpt",
+  "base_model": "",
+  "reasoning_tokens": 128,
+  "block_size": 192,
+  "batch_size": 32,
+  "max_steps": 3000,
+  "learning_rate": 0.0002,
+  "router_loss_weight": 0.05,
+  "ranking_loss_weight": 0.2,
+  "device": "cuda",
+  "amp_dtype": "bf16",
+  "cpu_threads": 0,
+  "log_every": 20,
+  "seed": 1234
+}
