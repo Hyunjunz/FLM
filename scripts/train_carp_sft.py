@@ -34,6 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--router-loss-weight", type=float, default=0.2)
+    parser.add_argument("--ranking-loss-weight", type=float, default=0.5)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp-dtype", choices=["off", "fp16", "bf16"], default="off")
     parser.add_argument("--cpu-threads", type=int, default=0)
@@ -81,7 +82,12 @@ def main() -> None:
         for batch in loader:
             batch = {key: value.to(device) for key, value in batch.items()}
             with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                out = carp_sft_loss(model, batch, router_loss_weight=args.router_loss_weight)
+                out = carp_sft_loss(
+                    model,
+                    batch,
+                    router_loss_weight=args.router_loss_weight,
+                    ranking_loss_weight=args.ranking_loss_weight,
+                )
             out.loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optim.step()
@@ -91,6 +97,7 @@ def main() -> None:
                 print(
                     f"step {step}/{args.max_steps} loss {float(out.loss.detach()):.4f} "
                     f"lm {float(out.lm_loss):.4f} router {float(out.router_loss):.4f} "
+                    f"rank {float(out.ranking_loss):.4f} "
                     f"router_acc {out.router_accuracy:.3f}",
                     flush=True,
                 )

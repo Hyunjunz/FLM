@@ -29,6 +29,8 @@ class CARPTraceExample:
     difficulty: str = "medium"
     verifier_required: bool = False
     candidate_count: int = 1
+    candidates: List[str] | None = None
+    gold_label: str = ""
 
 
 def normalize_reasoning_tokens(tokens: Sequence[str] | None, max_tokens: int) -> List[str]:
@@ -57,6 +59,8 @@ def parse_carp_trace(example: Dict[str, Any], max_reasoning_tokens: int = 128) -
         difficulty=difficulty,
         verifier_required=bool(example.get("verifier_required", difficulty in {"hard", "critical"})),
         candidate_count=int(example.get("candidate_count", 1 if difficulty in {"easy", "medium"} else 3)),
+        candidates=[str(item) for item in example.get("candidates", [])] or None,
+        gold_label=str(example.get("gold_label", "")).strip(),
     )
 
 
@@ -118,13 +122,27 @@ class CARPJsonlSFTDataset(Dataset):
                 if "text" in raw:
                     text = str(raw["text"])
                     router = raw.get("router_label", {})
+                    prompt_text = str(raw.get("prompt", ""))
+                    candidates = [str(item) for item in raw.get("candidates", [])]
+                    gold_label = str(raw.get("gold_label", "")).strip()
                 else:
                     trace = parse_carp_trace(raw, max_reasoning_tokens=max_reasoning_tokens)
                     prompt, answer = build_carp_instruction_text(trace)
                     text = prompt + answer
                     router = build_router_label(trace)
+                    prompt_text = prompt
+                    candidates = trace.candidates or []
+                    gold_label = trace.gold_label
                 if text.strip():
-                    self.rows.append({"text": text, "router_label": router})
+                    self.rows.append(
+                        {
+                            "text": text,
+                            "prompt": prompt_text,
+                            "router_label": router,
+                            "candidates": candidates,
+                            "gold_label": gold_label,
+                        }
+                    )
                 if max_examples is not None and len(self.rows) >= max_examples:
                     break
         if not self.rows:
@@ -147,7 +165,7 @@ class CARPJsonlSFTDataset(Dataset):
         candidate_count = int(router.get("candidate_count", 1))
         reasoning_budget = int(router.get("reasoning_budget", 0))
         x = torch.tensor(ids, dtype=torch.long)
-        return {
+        item = {
             "input_ids": x,
             "labels": x.clone(),
             "router_difficulty": torch.tensor(difficulty, dtype=torch.long),
@@ -155,6 +173,23 @@ class CARPJsonlSFTDataset(Dataset):
             "router_candidate_count": torch.tensor(candidate_count, dtype=torch.float),
             "router_reasoning_budget": torch.tensor(reasoning_budget, dtype=torch.float),
         }
+        candidates = row.get("candidates") or []
+        if candidates:
+            prompt_ids = self.tokenizer.encode(str(row.get("prompt") or "")).ids[: self.block_size]
+            candidate_ids = [self.tokenizer.encode(str(candidate)).ids[:64] for candidate in candidates]
+            gold_label = str(row.get("gold_label") or "").strip()
+            gold_idx = 0
+            for idx, candidate in enumerate(candidates):
+                if gold_label and str(candidate).startswith(f"{gold_label}."):
+                    gold_idx = idx
+                    break
+                if gold_label and str(candidate).strip().lower() == gold_label.lower():
+                    gold_idx = idx
+                    break
+            item["prompt_ids"] = torch.tensor(prompt_ids or [self.eos_id or 2], dtype=torch.long)
+            item["candidate_ids"] = [torch.tensor(ids or [self.eos_id or 2], dtype=torch.long) for ids in candidate_ids]
+            item["gold_choice"] = torch.tensor(gold_idx, dtype=torch.long)
+        return item
 
 
 def collate_carp_sft(batch: Sequence[Dict[str, torch.Tensor]], pad_token_id: int = 0) -> Dict[str, torch.Tensor]:
@@ -167,7 +202,7 @@ def collate_carp_sft(batch: Sequence[Dict[str, torch.Tensor]], pad_token_id: int
         input_ids[idx, :n] = item["input_ids"]
         labels[idx, :n] = item["labels"]
         attention_mask[idx, :n] = 1
-    return {
+    out = {
         "input_ids": input_ids,
         "labels": labels,
         "attention_mask": attention_mask,
@@ -175,6 +210,41 @@ def collate_carp_sft(batch: Sequence[Dict[str, torch.Tensor]], pad_token_id: int
         "router_verifier_required": torch.stack([item["router_verifier_required"] for item in batch]),
         "router_candidate_count": torch.stack([item["router_candidate_count"] for item in batch]),
         "router_reasoning_budget": torch.stack([item["router_reasoning_budget"] for item in batch]),
+    }
+    out.update(_collate_choice_fields(batch, pad_token_id))
+    return out
+
+
+def _collate_choice_fields(batch: Sequence[Dict[str, torch.Tensor]], pad_token_id: int) -> Dict[str, torch.Tensor]:
+    if not all("candidate_ids" in item and "prompt_ids" in item for item in batch):
+        return {}
+    batch_size = len(batch)
+    max_prompt = max(item["prompt_ids"].numel() for item in batch)
+    max_choices = max(len(item["candidate_ids"]) for item in batch)
+    max_candidate = max(candidate.numel() for item in batch for candidate in item["candidate_ids"])
+    prompt_ids = torch.full((batch_size, max_prompt), pad_token_id, dtype=torch.long)
+    prompt_attention_mask = torch.zeros((batch_size, max_prompt), dtype=torch.long)
+    candidate_ids = torch.full((batch_size, max_choices, max_candidate), pad_token_id, dtype=torch.long)
+    candidate_attention_mask = torch.zeros((batch_size, max_choices, max_candidate), dtype=torch.long)
+    candidate_mask = torch.zeros((batch_size, max_choices), dtype=torch.bool)
+    gold_choice = torch.zeros((batch_size,), dtype=torch.long)
+    for batch_idx, item in enumerate(batch):
+        n = item["prompt_ids"].numel()
+        prompt_ids[batch_idx, :n] = item["prompt_ids"]
+        prompt_attention_mask[batch_idx, :n] = 1
+        gold_choice[batch_idx] = item["gold_choice"]
+        for choice_idx, candidate in enumerate(item["candidate_ids"]):
+            m = candidate.numel()
+            candidate_ids[batch_idx, choice_idx, :m] = candidate
+            candidate_attention_mask[batch_idx, choice_idx, :m] = 1
+            candidate_mask[batch_idx, choice_idx] = True
+    return {
+        "prompt_ids": prompt_ids,
+        "prompt_attention_mask": prompt_attention_mask,
+        "candidate_ids": candidate_ids,
+        "candidate_attention_mask": candidate_attention_mask,
+        "candidate_mask": candidate_mask,
+        "gold_choice": gold_choice,
     }
 
 

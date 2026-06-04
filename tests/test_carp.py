@@ -121,7 +121,11 @@ def test_carp_sft_loss(tmp_path):
     add_reasoning_tokens(tok, 8)
     data = tmp_path / "carp.jsonl"
     data.write_text(
-        '{"question":"What is 1 + 2?","answer":"3","reasoning_tokens":["<R0>"],"difficulty":"medium"}\n',
+        (
+            '{"question":"What is 1 + 2?","answer":"A. 3",'
+            '"candidates":["A. 3","B. 4"],"gold_label":"A",'
+            '"reasoning_tokens":["<R0>"],"difficulty":"medium"}\n'
+        ),
         encoding="utf-8",
     )
     ds = CARPJsonlSFTDataset(data, tok, block_size=32, max_reasoning_tokens=8)
@@ -141,3 +145,4 @@ def test_carp_sft_loss(tmp_path):
     out = carp_sft_loss(model, batch)
     assert out.loss.ndim == 0
     assert out.router_loss.ndim == 0
+    assert out.ranking_loss.ndim == 0

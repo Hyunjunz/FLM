@@ -28,15 +28,16 @@ export PYTHONPATH="$CODE_ROOT${PYTHONPATH:+:$PYTHONPATH}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
-DATASET="${DATASET:-tau/commonsense_qa}"
+DATASET="${DATASET:-mix_language}"
+EVAL_DATASET="${EVAL_DATASET:-tau/commonsense_qa}"
 SPLIT="${SPLIT:-train}"
-DATA="${DATA:-data/carp_commonsenseqa_train.jsonl}"
+DATA="${DATA:-data/carp_language_mix_train.jsonl}"
 TOKENIZER="${TOKENIZER:-artifacts/tokenizer_rtx4090_32k}"
 CONFIG="${CONFIG:-configs/carp_cpu_large.json}"
 OUTPUT_DIR="${OUTPUT_DIR:-artifacts/carp_cpu_large_ckpt}"
 BASE_MODEL="${BASE_MODEL:-}"
 
-MAX_EXAMPLES="${MAX_EXAMPLES:-9741}"
+MAX_EXAMPLES="${MAX_EXAMPLES:-0}"
 VOCAB_SIZE="${VOCAB_SIZE:-32000}"
 REASONING_TOKENS="${REASONING_TOKENS:-128}"
 BLOCK_SIZE="${BLOCK_SIZE:-256}"
@@ -44,6 +45,7 @@ BATCH_SIZE="${BATCH_SIZE:-16}"
 MAX_STEPS="${MAX_STEPS:-5000}"
 LEARNING_RATE="${LEARNING_RATE:-2e-4}"
 ROUTER_LOSS_WEIGHT="${ROUTER_LOSS_WEIGHT:-0.05}"
+RANKING_LOSS_WEIGHT="${RANKING_LOSS_WEIGHT:-0.5}"
 AMP_DTYPE="${AMP_DTYPE:-fp16}"
 DEVICE="${DEVICE:-cuda}"
 CPU_THREADS="${CPU_THREADS:-0}"
@@ -86,6 +88,7 @@ args=(
   --max-steps "$MAX_STEPS"
   --learning-rate "$LEARNING_RATE"
   --router-loss-weight "$ROUTER_LOSS_WEIGHT"
+  --ranking-loss-weight "$RANKING_LOSS_WEIGHT"
   --device "$DEVICE"
   --amp-dtype "$AMP_DTYPE"
   --cpu-threads "$CPU_THREADS"
@@ -106,7 +109,7 @@ python -u scripts/eval_carp_router.py \
 
 python -u scripts/eval_carp_language_answer.py \
   --model "$OUTPUT_DIR" \
-  --dataset "$DATASET" \
+  --dataset "$EVAL_DATASET" \
   --split validation \
   --max-examples 200 \
   --device "$DEVICE" \
