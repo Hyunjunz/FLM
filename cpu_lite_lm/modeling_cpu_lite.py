@@ -49,6 +49,12 @@ class CPULiteCausalLMOutput:
     past_key_values: Optional[List[PastKeyValue]]
 
 
+@dataclass
+class CPULiteCARPHeadOutput:
+    router_logits: Optional[torch.Tensor]
+    verifier_logits: Optional[torch.Tensor]
+
+
 class CPULiteRMSNorm(nn.Module):
     def __init__(self, hidden_size: int, eps: float = 1e-6) -> None:
         super().__init__()
@@ -337,8 +343,22 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
         super().__init__(config)
         self.model = CPULiteModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        self.router_head = (
+            nn.Linear(config.hidden_size, config.carp_router_labels, bias=True)
+            if getattr(config, "carp_router_labels", 0) > 0
+            else None
+        )
+        self.verifier_head = (
+            nn.Linear(config.hidden_size, config.carp_verifier_labels, bias=True)
+            if getattr(config, "carp_verifier_labels", 0) > 0
+            else None
+        )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+            if self.router_head is not None:
+                self._init_weights(self.router_head)
+            if self.verifier_head is not None:
+                self._init_weights(self.verifier_head)
         else:
             self.apply(self._init_weights)
 
@@ -440,6 +460,49 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
 
         return CPULiteCausalLMOutput(loss=loss, logits=logits, past_key_values=cache)
 
+    def carp_heads(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> CPULiteCARPHeadOutput:
+        hidden, _, _, _ = self.model(
+            input_ids,
+            attention_mask=attention_mask,
+            use_cache=False,
+        )
+        pooled = hidden[:, -1, :]
+        router_logits = self.router_head(pooled) if self.router_head is not None else None
+        verifier_logits = self.verifier_head(pooled) if self.verifier_head is not None else None
+        return CPULiteCARPHeadOutput(router_logits=router_logits, verifier_logits=verifier_logits)
+
+    def resize_token_embeddings(self, new_size: int) -> nn.Embedding:
+        if new_size <= 0:
+            raise ValueError("new_size must be positive")
+        old_embed = self.model.embed_tokens
+        old_size, hidden_size = old_embed.weight.shape
+        if new_size == old_size:
+            return old_embed
+        new_embed = nn.Embedding(new_size, hidden_size, self.config.pad_token_id)
+        self._init_weights(new_embed)
+        copy_size = min(old_size, new_size)
+        with torch.no_grad():
+            new_embed.weight[:copy_size] = old_embed.weight[:copy_size]
+        self.model.embed_tokens = new_embed.to(device=old_embed.weight.device, dtype=old_embed.weight.dtype)
+        self.config.vocab_size = new_size
+        if self.config.tie_word_embeddings:
+            self.lm_head = nn.Linear(hidden_size, new_size, bias=False).to(
+                device=old_embed.weight.device,
+                dtype=old_embed.weight.dtype,
+            )
+            self.lm_head.weight = self.model.embed_tokens.weight
+        else:
+            old_head = self.lm_head
+            new_head = nn.Linear(hidden_size, new_size, bias=False)
+            self._init_weights(new_head)
+            with torch.no_grad():
+                new_head.weight[:copy_size] = old_head.weight[:copy_size]
+            self.lm_head = new_head.to(device=old_head.weight.device, dtype=old_head.weight.dtype)
+        return self.model.embed_tokens
 
     @torch.no_grad()
     def generate_simple(

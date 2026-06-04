@@ -53,6 +53,9 @@ class CPULiteConfig(PretrainedConfig):
         tie_word_embeddings: bool = True,
         use_sdpa: bool = True,
         initializer_range: float = 0.02,
+        carp_num_reasoning_tokens: int = 0,
+        carp_router_labels: int = 0,
+        carp_verifier_labels: int = 0,
         bos_token_id: int = 1,
         eos_token_id: int = 2,
         pad_token_id: int = 0,
@@ -77,6 +80,9 @@ class CPULiteConfig(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
         self.use_sdpa = use_sdpa
         self.initializer_range = initializer_range
+        self.carp_num_reasoning_tokens = carp_num_reasoning_tokens
+        self.carp_router_labels = carp_router_labels
+        self.carp_verifier_labels = carp_verifier_labels
         self.bos_token_id = bos_token_id
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
