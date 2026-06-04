@@ -229,7 +229,7 @@ class ReasoningCompressor:
             categories.append("math")
         if any(word in lowered for word in ("코드", "버그", "deadlock", "함수", "class", "python")):
             categories.append("code")
-        if any(word in lowered for word in ("왜", "논리", "조건", "증명", "모순")):
+        if any(word in lowered for word in ("왜", "논리", "조건", "증명", "모순", "commonsense", "choices")):
             categories.append("logic")
         if len(lowered) > 500 or "\n" in lowered:
             categories.append("retrieval")

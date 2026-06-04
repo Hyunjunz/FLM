@@ -13,6 +13,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from cpu_lite_lm.carp import CARPGenerator
+from cpu_lite_lm.carp import ReasoningCompressor
 from cpu_lite_lm.generate import _amp_dtype, _resolve_device
 from cpu_lite_lm.modeling_cpu_lite import CPULiteForCausalLM
 from cpu_lite_lm.tokenizer_train import load_tokenizer
@@ -44,7 +45,11 @@ def load_commonsense_qa(split: str, max_examples: int) -> List[Dict[str, Any]]:
             f"Choices:\n{choices}\n\n"
             "Answer with the option letter and text."
         )
-        rows.append({"prompt": prompt, "gold": str(row["answerKey"]).upper()})
+        candidates = [
+            f"{label}. {text}"
+            for label, text in zip(row["choices"]["label"], row["choices"]["text"])
+        ]
+        rows.append({"prompt": prompt, "gold": str(row["answerKey"]).upper(), "candidates": candidates})
     return rows
 
 
@@ -80,6 +85,29 @@ def parse_boolq(text: str) -> str:
     return "no"
 
 
+@torch.no_grad()
+def mean_logprob_score(model, tokenizer, prompt_text: str, answer_text: str, device: torch.device) -> float:
+    prompt_ids = tokenizer.encode(prompt_text).ids
+    answer_ids = tokenizer.encode(answer_text).ids
+    if not answer_ids:
+        return -1e9
+    ids = torch.tensor([prompt_ids + answer_ids], dtype=torch.long, device=device)
+    out = model(ids, use_cache=False)
+    logits = out.logits[:, max(0, len(prompt_ids) - 1) : -1, :]
+    labels = ids[:, len(prompt_ids) :]
+    if logits.numel() == 0 or labels.numel() == 0:
+        return -1e9
+    logprobs = torch.log_softmax(logits, dim=-1)
+    chosen = torch.gather(logprobs, -1, labels.unsqueeze(-1)).squeeze(-1)
+    return float(chosen.mean().item())
+
+
+def build_scoring_prompt(generator: CARPGenerator, prompt: str) -> str:
+    route = generator.router.route(prompt)
+    reasoning_tokens = generator.compressor.select(prompt, route)
+    return generator._build_prompt(prompt, reasoning_tokens)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="artifacts/carp_language_ckpt")
@@ -93,6 +121,7 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--baseline", action="store_true", help="Use direct model generation instead of CARP routing.")
+    parser.add_argument("--generate", action="store_true", help="Use free-form generation instead of multiple-choice scoring.")
     parser.add_argument("--no-speculative", action="store_true")
     parser.add_argument("--print-every", type=int, default=25)
     args = parser.parse_args()
@@ -117,26 +146,41 @@ def main() -> None:
         for idx, row in enumerate(rows, start=1):
             if args.baseline:
                 prompt_text = f"### Question:\n{row['prompt']}\n\n### Answer:\n"
-                ids = torch.tensor([tokenizer.encode(prompt_text).ids], dtype=torch.long, device=device)
-                out = model.generate_simple(
-                    ids,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    top_k=args.top_k,
-                    eos_token_id=None,
-                )
-                new_ids = out[0, ids.size(1) :].tolist()
-                answer = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+                if not args.generate and "candidates" in row:
+                    scored = [
+                        (mean_logprob_score(model, tokenizer, prompt_text, candidate, device), candidate)
+                        for candidate in row["candidates"]
+                    ]
+                    answer = max(scored, key=lambda item: item[0])[1]
+                else:
+                    ids = torch.tensor([tokenizer.encode(prompt_text).ids], dtype=torch.long, device=device)
+                    out = model.generate_simple(
+                        ids,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=args.temperature,
+                        top_k=args.top_k,
+                        eos_token_id=None,
+                    )
+                    new_ids = out[0, ids.size(1) :].tolist()
+                    answer = tokenizer.decode(new_ids, skip_special_tokens=True).strip()
             else:
-                result = generator.generate(
-                    row["prompt"],
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    top_k=args.top_k,
-                    use_speculative=not args.no_speculative,
-                    eos_token_id=None,
-                )
-                answer = result.answer
+                if not args.generate and "candidates" in row:
+                    prompt_text = build_scoring_prompt(generator, row["prompt"])
+                    scored = [
+                        (mean_logprob_score(model, tokenizer, prompt_text, candidate, device), candidate)
+                        for candidate in row["candidates"]
+                    ]
+                    answer = max(scored, key=lambda item: item[0])[1]
+                else:
+                    result = generator.generate(
+                        row["prompt"],
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=args.temperature,
+                        top_k=args.top_k,
+                        use_speculative=not args.no_speculative,
+                        eos_token_id=None,
+                    )
+                    answer = result.answer
             pred = parser_fn(answer)
             if pred:
                 parsed += 1
