@@ -28,6 +28,11 @@ This repository now has a runnable first CARP layer on top of CPULiteLM.
   - Trains LM loss plus router-head loss from CARP JSONL traces.
 - `scripts/eval_carp_router.py`
   - Reports router-head accuracy and a 4x4 confusion matrix.
+- `scripts/download_carp_language.py`
+  - Downloads language reasoning datasets and converts them to CARP traces.
+  - Supports `tau/commonsense_qa` and `google/boolq`.
+- `scripts/train_carp_language_vast.sh`
+  - Vast/Linux CUDA one-command run for real language reasoning data.
 - `cpu_lite_lm.carp_train`
   - Adds `carp_sft_loss()` for combined LM/router training.
 - `CPULiteConfig`
@@ -89,6 +94,18 @@ python scripts/train_carp_sft.py \
 python scripts/eval_carp_router.py \
   --model artifacts/carp_sft_ckpt \
   --data data/carp_synthetic.jsonl
+```
+
+Run a real language-reasoning dataset experiment on Vast:
+
+```bash
+bash scripts/train_carp_language_vast.sh
+```
+
+The default dataset is `tau/commonsense_qa`. Override it with:
+
+```bash
+DATASET=google/boolq MAX_EXAMPLES=5000 bash scripts/train_carp_language_vast.sh
 ```
 
 If the model checkpoint was trained before adding reasoning tokens, expand the
