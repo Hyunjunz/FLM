@@ -43,6 +43,8 @@ REASONING_TOKENS="${REASONING_TOKENS:-128}"
 BLOCK_SIZE="${BLOCK_SIZE:-256}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 MAX_STEPS="${MAX_STEPS:-5000}"
+SAVE_EVERY="${SAVE_EVERY:-0}"
+SAVE_STEP_DIRS="${SAVE_STEP_DIRS:-0}"
 LEARNING_RATE="${LEARNING_RATE:-2e-4}"
 ROUTER_LOSS_WEIGHT="${ROUTER_LOSS_WEIGHT:-0.05}"
 RANKING_LOSS_WEIGHT="${RANKING_LOSS_WEIGHT:-0.5}"
@@ -89,6 +91,7 @@ args=(
   --learning-rate "$LEARNING_RATE"
   --router-loss-weight "$ROUTER_LOSS_WEIGHT"
   --ranking-loss-weight "$RANKING_LOSS_WEIGHT"
+  --save-every "$SAVE_EVERY"
   --device "$DEVICE"
   --amp-dtype "$AMP_DTYPE"
   --cpu-threads "$CPU_THREADS"
@@ -96,6 +99,10 @@ args=(
 
 if [[ -n "$BASE_MODEL" ]]; then
   args+=(--base-model "$BASE_MODEL")
+fi
+
+if [[ "$SAVE_STEP_DIRS" == "1" ]]; then
+  args+=(--save-step-dirs)
 fi
 
 python -u scripts/train_carp_sft.py "${args[@]}"

@@ -39,6 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amp-dtype", choices=["off", "fp16", "bf16"], default="off")
     parser.add_argument("--cpu-threads", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=20)
+    parser.add_argument("--save-every", type=int, default=0)
+    parser.add_argument("--save-step-dirs", action="store_true")
     parser.add_argument("--seed", type=int, default=1234)
     return parser
 
@@ -101,15 +103,25 @@ def main() -> None:
                     f"router_acc {out.router_accuracy:.3f}",
                     flush=True,
                 )
+            if args.save_every > 0 and step % args.save_every == 0:
+                save_dir = Path(args.output_dir) / f"step_{step}" if args.save_step_dirs else Path(args.output_dir)
+                _save_checkpoint(model, tokenizer, args, save_dir, step)
             if step >= args.max_steps:
                 break
 
-    output = Path(args.output_dir)
+    output = _save_checkpoint(model, tokenizer, args, Path(args.output_dir), step)
+    print(f"Saved CARP SFT checkpoint to {output}")
+
+
+def _save_checkpoint(model, tokenizer, args: argparse.Namespace, output: Path, step: int) -> Path:
     output.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(output)
     tokenizer.save(str(output / "tokenizer.json"))
-    (output / "carp_sft_args.json").write_text(json.dumps(vars(args), indent=2, default=str), encoding="utf-8")
-    print(f"Saved CARP SFT checkpoint to {output}")
+    payload = vars(args).copy()
+    payload["last_step"] = step
+    (output / "carp_sft_args.json").write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    print(f"Saved CARP SFT checkpoint step={step} to {output}", flush=True)
+    return output
 
 
 if __name__ == "__main__":
