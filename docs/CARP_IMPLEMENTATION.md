@@ -33,6 +33,10 @@ This repository now has a runnable first CARP layer on top of CPULiteLM.
   - Supports `tau/commonsense_qa` and `google/boolq`.
 - `scripts/train_carp_language_vast.sh`
   - Vast/Linux CUDA one-command run for real language reasoning data.
+- `scripts/carp_language_infer.py`
+  - Runs a single CommonsenseQA-style inference prompt.
+- `scripts/eval_carp_language_answer.py`
+  - Measures generated answer exact-match accuracy on CommonsenseQA or BoolQ.
 - `cpu_lite_lm.carp_train`
   - Adds `carp_sft_loss()` for combined LM/router training.
 - `CPULiteConfig`
@@ -106,6 +110,26 @@ The default dataset is `tau/commonsense_qa`. Override it with:
 
 ```bash
 DATASET=google/boolq MAX_EXAMPLES=5000 bash scripts/train_carp_language_vast.sh
+```
+
+Run one trained inference:
+
+```bash
+python scripts/carp_language_infer.py \
+  --model artifacts/carp_language_ckpt \
+  --question "Where would you keep a pillow when you sleep?" \
+  --choices "A. garage\nB. bed\nC. oven\nD. road\nE. shower" \
+  --show-carp
+```
+
+Evaluate generated answers:
+
+```bash
+python scripts/eval_carp_language_answer.py \
+  --model artifacts/carp_language_ckpt \
+  --dataset tau/commonsense_qa \
+  --split validation \
+  --max-examples 200
 ```
 
 If the model checkpoint was trained before adding reasoning tokens, expand the
