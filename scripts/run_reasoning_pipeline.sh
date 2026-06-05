@@ -8,6 +8,20 @@ python scripts/prepare_700m_dataset.py \
   --seed 42 \
   --max-text-chars 4096
 
+python scripts/prepare_700m_dataset.py \
+  --output data/eval.jsonl \
+  --total-count 1000 \
+  --seed 43 \
+  --max-text-chars 4096
+
+python scripts/prepare_reasoning_artifacts.py \
+  --train data/train.jsonl \
+  --eval data/eval.jsonl \
+  --reasoning-sft data/reasoning_sft.jsonl \
+  --reasoning-eval data/reasoning_eval.jsonl \
+  --verifier-train data/verifier_train.jsonl \
+  --verifier-eval data/verifier_eval.jsonl
+
 # 2. Base continued pretraining.
 python -m cpu_lite_lm.train \
   --config configs/carp_700m.json \

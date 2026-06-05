@@ -1,6 +1,16 @@
 #!/bin/bash
 set -e
 
+if [ ! -f data/reasoning_sft.jsonl ]; then
+  python scripts/prepare_reasoning_artifacts.py \
+    --train data/train.jsonl \
+    --eval data/eval.jsonl \
+    --reasoning-sft data/reasoning_sft.jsonl \
+    --reasoning-eval data/reasoning_eval.jsonl \
+    --verifier-train data/verifier_train.jsonl \
+    --verifier-eval data/verifier_eval.jsonl
+fi
+
 python -m cpu_lite_lm.train_reasoning_sft \
   --model artifacts/base_ckpt \
   --tokenizer artifacts/tokenizer \

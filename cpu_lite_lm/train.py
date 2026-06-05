@@ -173,6 +173,12 @@ def train(args: argparse.Namespace) -> Path:
     eval_loader = None
     if args.eval_every > 0:
         eval_data = args.eval_data or args.data
+        if args.eval_data and not Path(eval_data).exists():
+            print(
+                f"Validation data not found at {eval_data}; falling back to training data {args.data}.",
+                flush=True,
+            )
+            eval_data = args.data
         print(
             f"Building validation loader from {eval_data} "
             f"(docs={args.eval_docs}, max_chars={args.eval_max_chars})",

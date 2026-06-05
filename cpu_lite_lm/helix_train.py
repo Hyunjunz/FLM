@@ -397,7 +397,7 @@ def main() -> None:
         collate_fn=lambda batch: collate_helix(batch, model.config.pad_token_id),
     )
     eval_loader = None
-    if args.eval_data:
+    if args.eval_data and Path(args.eval_data).exists():
         eval_dataset = HelixJsonlDataset(args.eval_data, tokenizer, block_size=args.block_size)
         eval_loader = DataLoader(
             eval_dataset,
@@ -405,6 +405,8 @@ def main() -> None:
             shuffle=False,
             collate_fn=lambda batch: collate_helix(batch, model.config.pad_token_id),
         )
+    elif args.eval_data:
+        print(f"Helix/verifier eval data not found at {args.eval_data}; skipping eval loader.", flush=True)
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=args.learning_rate,

@@ -58,7 +58,7 @@ def train_reasoning_sft(args: argparse.Namespace) -> Path:
         pin_memory=device.type == "cuda",
     )
     eval_loader = None
-    if args.eval_data:
+    if args.eval_data and Path(args.eval_data).exists():
         eval_ds = ReasoningSFTJsonlDataset(
             args.eval_data,
             tokenizer,
@@ -73,6 +73,8 @@ def train_reasoning_sft(args: argparse.Namespace) -> Path:
             shuffle=False,
             collate_fn=lambda b: collate_causal_lm(b, model.config.pad_token_id),
         )
+    elif args.eval_data:
+        print(f"Reasoning eval data not found at {args.eval_data}; skipping eval loader.", flush=True)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
     amp_dtype = autocast_dtype(args.amp_dtype)
