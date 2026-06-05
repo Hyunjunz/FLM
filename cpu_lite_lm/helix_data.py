@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import random
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Tuple
@@ -82,16 +83,36 @@ def _extract_prompt(item: Dict[str, Any]) -> str:
 def write_jsonl(rows: Iterable[HelixRow], output: str | Path) -> Path:
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
+    tmp_output = output.with_suffix(output.suffix + ".tmp")
     count = 0
-    with output.open("w", encoding="utf-8") as handle:
+    with tmp_output.open("w", encoding="utf-8") as handle:
         for row in rows:
             prompt = str(row.get("prompt", "")).strip()
             if not prompt:
                 continue
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             count += 1
+    os.replace(tmp_output, output)
     print(f"Wrote {count} Helix rows to {output}", flush=True)
     return output
+
+
+def iter_jsonl_objects(path: str | Path, skip_bad: bool = True):
+    path = Path(path)
+    skipped = 0
+    with path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError as exc:
+                if not skip_bad:
+                    raise
+                skipped += 1
+                print(f"Skipped malformed JSONL record at {path}:{line_no}: {exc}", flush=True)
+    if skipped:
+        print(f"Skipped {skipped} malformed JSONL records from {path}", flush=True)
 
 
 def summarize_helix_rows(rows: Iterable[HelixRow]) -> Dict[str, Dict[str, int]]:
@@ -177,15 +198,12 @@ def convert_jsonl_to_helix(input_path: str | Path, output_path: str | Path) -> P
     input_path = Path(input_path)
     converted: List[HelixRow] = []
     skipped = 0
-    with input_path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            row = normalize_helix_row(json.loads(line))
-            if row is None:
-                skipped += 1
-                continue
-            converted.append(row)
+    for item in iter_jsonl_objects(input_path, skip_bad=True):
+        row = normalize_helix_row(item)
+        if row is None:
+            skipped += 1
+            continue
+        converted.append(row)
     output = write_jsonl(converted, output_path)
     if skipped:
         print(f"Skipped {skipped} rows without usable text fields", flush=True)

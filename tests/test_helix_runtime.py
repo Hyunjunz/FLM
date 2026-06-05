@@ -119,3 +119,15 @@ def test_convert_mixed_jsonl_to_helix(tmp_path):
     rows = out.read_text(encoding="utf-8").splitlines()
     assert len(rows) == 3
     assert "prompt" in rows[0]
+
+
+def test_convert_skips_malformed_jsonl(tmp_path):
+    src = tmp_path / "bad.jsonl"
+    src.write_text(
+        '{"prompt":"good","difficulty":"easy","accepted":true}\n{"prompt":"broken\n',
+        encoding="utf-8",
+    )
+    out = tmp_path / "helix.jsonl"
+    convert_jsonl_to_helix(src, out)
+    rows = out.read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 1

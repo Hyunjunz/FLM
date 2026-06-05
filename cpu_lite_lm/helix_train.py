@@ -15,7 +15,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from .configuration_cpu_lite import CPULiteConfig
 from .generate import load_model
-from .helix_data import convert_jsonl_to_helix, normalize_helix_row, prepare_helix_dataset, print_helix_summary
+from .helix_data import (
+    convert_jsonl_to_helix,
+    iter_jsonl_objects,
+    normalize_helix_row,
+    prepare_helix_dataset,
+    print_helix_summary,
+)
 from .helix_runtime import HelixDifficultyRouter
 from .modeling_cpu_lite import CPULiteForCausalLM
 from .tokenizer_train import load_tokenizer, train_tokenizer
@@ -44,10 +50,8 @@ class HelixJsonlDataset(Dataset):
         self.router = HelixDifficultyRouter()
         self.rows = []
         skipped = 0
-        for line_no, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), start=1):
-            if not line.strip():
-                continue
-            row = self._parse(line)
+        for item in iter_jsonl_objects(self.path, skip_bad=True):
+            row = self._parse(item)
             if row is None:
                 skipped += 1
                 continue
@@ -57,8 +61,8 @@ class HelixJsonlDataset(Dataset):
         if not self.rows:
             raise ValueError(f"no rows found in {self.path}")
 
-    def _parse(self, line: str) -> Dict[str, Any] | None:
-        item = normalize_helix_row(json.loads(line))
+    def _parse(self, raw_item: Dict[str, Any]) -> Dict[str, Any] | None:
+        item = normalize_helix_row(raw_item)
         if item is None:
             return None
         prompt = item["prompt"]
@@ -97,11 +101,9 @@ def materialize_tokenizer_corpus(data_path: str | Path, output_path: str | Path)
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     written = 0
-    with data_path.open("r", encoding="utf-8") as src, output_path.open("w", encoding="utf-8") as dst:
-        for line in src:
-            if not line.strip():
-                continue
-            item = normalize_helix_row(json.loads(line))
+    with output_path.open("w", encoding="utf-8") as dst:
+        for raw_item in iter_jsonl_objects(data_path, skip_bad=True):
+            item = normalize_helix_row(raw_item)
             text = None if item is None else item.get("prompt")
             if isinstance(text, str) and text.strip():
                 dst.write(text.strip().replace("\r\n", "\n") + "\n")
