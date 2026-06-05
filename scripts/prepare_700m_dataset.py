@@ -25,11 +25,11 @@ except ImportError:  # pragma: no cover
     raise SystemExit(1)
 
 # Sample-level ratios. Token-level ratios will differ because general text rows are longer.
-RATIO_GENERAL = 0.45
+RATIO_GENERAL = 0.35
 RATIO_INSTRUCTION = 0.20
-RATIO_CHOICE = 0.20
+RATIO_CHOICE = 0.25
 RATIO_CARP = 0.10
-RATIO_MATH_CODE = 0.05
+RATIO_MATH_CODE = 0.10
 
 LETTERS = [chr(65 + i) for i in range(26)]
 CHOICE_RE = re.compile(r"^\s*([^.)\s]+)\s*[.)]\s*(.*)\s*$")
@@ -430,6 +430,62 @@ def get_math_code(count: int, max_chars: int) -> List[Dict[str, Any]]:
             })
     except Exception as exc:
         print(f"Error loading GSM8K: {exc}")
+    if len(rows) < count:
+        rows.extend(get_synthetic_reasoning(count - len(rows)))
+    return rows[:count]
+
+
+def get_synthetic_reasoning(count: int) -> List[Dict[str, Any]]:
+    print(f"Generating {count} synthetic reasoning samples...")
+    rows: List[Dict[str, Any]] = []
+    templates = [
+        lambda a, b: {
+            "question": f"What is {a} * {b}?",
+            "plan": "Multiply the two integers and keep the final number separate.",
+            "solution": f"{a} * {b} = {a * b}.",
+            "answer": str(a * b),
+            "type": "math_synthetic",
+        },
+        lambda a, b: {
+            "question": f"x + {a} = {b}. Solve for x.",
+            "plan": "Subtract the same value from both sides.",
+            "solution": f"x = {b} - {a} = {b - a}.",
+            "answer": str(b - a),
+            "type": "math_synthetic",
+        },
+        lambda a, b: {
+            "question": "다음 Python 코드의 버그를 찾아라: for i in range(len(xs)+1): print(xs[i])",
+            "plan": "반복 범위와 인덱스 접근을 확인한다.",
+            "solution": "range(len(xs)+1)는 마지막에 xs[len(xs)]를 접근하므로 범위를 벗어난다.\n수정 코드: for i in range(len(xs)): print(xs[i])",
+            "answer": "인덱스 범위 오류",
+            "type": "code_debug_ko_synthetic",
+        },
+        lambda a, b: {
+            "question": f"철수는 사과 {a}개를 사고 {b}개를 더 샀다. 몇 개인가?",
+            "plan": "처음 개수와 추가 개수를 더한다.",
+            "solution": f"{a} + {b} = {a + b}.",
+            "answer": str(a + b),
+            "type": "math_ko_synthetic",
+        },
+    ]
+    for idx in range(count):
+        a = random.randint(2, 20)
+        b = random.randint(5, 40)
+        row = templates[idx % len(templates)](a, b)
+        prompt = (
+            f"### Question:\n{row['question']}\n\n"
+            f"### Plan:\n{row['plan']}\n\n"
+            f"### Solution:\n{row['solution']}\n\n"
+            "### Answer:\n"
+        )
+        rows.append({
+            "text": prompt + row["answer"],
+            "prompt": prompt,
+            "answer": row["answer"],
+            "source": "synthetic_reasoning",
+            "type": row["type"],
+            "task_family": "math_code",
+        })
     return rows
 
 

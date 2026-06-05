@@ -25,6 +25,7 @@ from .helix_data import (
 )
 from .helix_runtime import HelixDifficultyRouter
 from .modeling_cpu_lite import CPULiteForCausalLM
+from .reasoning_data import VERIFIER_IGNORE_INDEX
 from .tokenizer_train import load_tokenizer, train_tokenizer
 from .train import autocast_dtype, resolve_device
 
@@ -41,7 +42,7 @@ class HelixJsonlDataset(Dataset):
       verifier_label/accepted/correct/is_correct: verifier target, 0|1
 
     Missing difficulty labels are filled by the deterministic Helix router.
-    Missing verifier labels default to 1, which is useful for route-only data.
+    Missing verifier labels are ignored for verifier loss, never treated as positive.
     """
 
     def __init__(self, path: str | Path, tokenizer, block_size: int = 256) -> None:
@@ -80,8 +81,8 @@ class HelixJsonlDataset(Dataset):
 
         verifier = item.get("verifier_label")
         if verifier is None:
-            verifier = item.get("accepted", item.get("correct", item.get("is_correct", 1)))
-        verifier_id = 1 if bool(verifier) else 0
+            verifier = item.get("accepted", item.get("correct", item.get("is_correct", None)))
+        verifier_id = _parse_verifier_label(verifier)
         weight = float(item.get("weight", 1.0))
         return {
             "input_ids": ids,
@@ -138,6 +139,19 @@ def collate_helix(batch: List[Dict[str, Any]], pad_token_id: int) -> Dict[str, t
     }
 
 
+def _parse_verifier_label(value: Any) -> int:
+    if value is None:
+        return VERIFIER_IGNORE_INDEX
+    if value == VERIFIER_IGNORE_INDEX:
+        return VERIFIER_IGNORE_INDEX
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"", "none", "null", "unknown"}:
+            return VERIFIER_IGNORE_INDEX
+        return 1 if lowered in {"1", "true", "yes", "correct", "accepted"} else 0
+    return 1 if bool(value) else 0
+
+
 def ensure_helix_heads(model: CPULiteForCausalLM) -> None:
     hidden = model.config.hidden_size
     if model.router_head is None or getattr(model.config, "carp_router_labels", 0) != 3:
@@ -183,29 +197,69 @@ def helix_head_loss(
     router_loss = F.cross_entropy(
         heads.router_logits, batch["router_labels"], reduction="none", label_smoothing=0.05
     )
-    verifier_loss = F.cross_entropy(
-        heads.verifier_logits, batch["verifier_labels"], reduction="none", label_smoothing=0.05
-    )
-    
-    # If a batch has no diverse verifier labels (e.g. all 1s), the loss might collapse.
-    # We can detect this and scale down verifier loss if it's not providing useful signal.
-    if batch["verifier_labels"].float().std() < 1e-4:
-        verifier_loss_weight = verifier_loss_weight * 0.1
+    valid_verifier = batch["verifier_labels"] != VERIFIER_IGNORE_INDEX
+    if valid_verifier.any():
+        verifier_labels = batch["verifier_labels"][valid_verifier]
+        class_counts = torch.bincount(verifier_labels, minlength=2).float().to(heads.verifier_logits.device)
+        class_weights = class_counts.sum().clamp_min(1.0) / (2.0 * class_counts.clamp_min(1.0))
+        verifier_loss = F.cross_entropy(
+            heads.verifier_logits[valid_verifier],
+            verifier_labels,
+            reduction="none",
+            weight=class_weights,
+            label_smoothing=0.05,
+        )
+        verifier_loss_full = torch.zeros_like(router_loss)
+        verifier_loss_full[valid_verifier] = verifier_loss
+    else:
+        verifier_loss_full = torch.zeros_like(router_loss)
+        verifier_loss_weight = 0.0
 
     weights = batch["weights"].to(router_loss.dtype)
     loss = (
-        (router_loss_weight * router_loss + verifier_loss_weight * verifier_loss) * weights
+        (router_loss_weight * router_loss + verifier_loss_weight * verifier_loss_full) * weights
     ).sum() / weights.sum().clamp_min(1.0)
     
     router_acc = (torch.argmax(heads.router_logits, dim=-1) == batch["router_labels"]).float().mean()
-    verifier_acc = (torch.argmax(heads.verifier_logits, dim=-1) == batch["verifier_labels"]).float().mean()
+    if valid_verifier.any():
+        verifier_acc = (
+            torch.argmax(heads.verifier_logits[valid_verifier], dim=-1) == batch["verifier_labels"][valid_verifier]
+        ).float().mean()
+        verifier_loss_mean = verifier_loss.detach().mean()
+    else:
+        verifier_acc = torch.zeros((), device=heads.verifier_logits.device)
+        verifier_loss_mean = torch.zeros((), device=heads.verifier_logits.device)
     return {
         "loss": loss,
         "router_loss": router_loss.mean().detach(),
-        "verifier_loss": verifier_loss.mean().detach(),
+        "verifier_loss": verifier_loss_mean,
         "router_acc": router_acc.detach(),
         "verifier_acc": verifier_acc.detach(),
     }
+
+
+@torch.no_grad()
+def evaluate_helix_heads(
+    model: CPULiteForCausalLM,
+    loader: DataLoader,
+    device: torch.device,
+    router_loss_weight: float,
+    verifier_loss_weight: float,
+) -> Dict[str, float]:
+    was_training = model.training
+    model.eval()
+    totals = {"loss": 0.0, "router_acc": 0.0, "verifier_acc": 0.0, "batches": 0.0}
+    for batch in loader:
+        batch = {key: value.to(device) for key, value in batch.items()}
+        out = helix_head_loss(model, batch, router_loss_weight, verifier_loss_weight)
+        totals["loss"] += float(out["loss"])
+        totals["router_acc"] += float(out["router_acc"])
+        totals["verifier_acc"] += float(out["verifier_acc"])
+        totals["batches"] += 1.0
+    if was_training:
+        model.train()
+    denom = max(totals["batches"], 1.0)
+    return {key: value / denom for key, value in totals.items() if key != "batches"}
 
 
 def build_lr_lambda(max_steps: int, warmup_steps: int, min_lr_ratio: float):
@@ -247,11 +301,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", default="artifacts/helix_ckpt")
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--router-loss-weight", type=float, default=0.5)
     parser.add_argument("--verifier-loss-weight", type=float, default=1.5)
+    parser.add_argument("--eval-data", default="")
     parser.add_argument("--train-last-n-layers", type=int, default=0)
     parser.add_argument("--train-norm", action="store_true")
     parser.add_argument("--warmup-steps", type=int, default=10)
@@ -328,9 +384,10 @@ def main() -> None:
     raw_rows = [
         {
             "difficulty": ("easy", "medium", "hard")[row["router_label"]],
-            "accepted": bool(row["verifier_label"]),
+            "accepted": bool(row["verifier_label"]) if row["verifier_label"] != VERIFIER_IGNORE_INDEX else False,
         }
         for row in dataset.rows
+        if row["verifier_label"] != VERIFIER_IGNORE_INDEX
     ]
     print_helix_summary(raw_rows, "Helix train split")
     loader = DataLoader(
@@ -339,6 +396,15 @@ def main() -> None:
         shuffle=True,
         collate_fn=lambda batch: collate_helix(batch, model.config.pad_token_id),
     )
+    eval_loader = None
+    if args.eval_data:
+        eval_dataset = HelixJsonlDataset(args.eval_data, tokenizer, block_size=args.block_size)
+        eval_loader = DataLoader(
+            eval_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=lambda batch: collate_helix(batch, model.config.pad_token_id),
+        )
     optimizer = torch.optim.AdamW(
         [parameter for parameter in model.parameters() if parameter.requires_grad],
         lr=args.learning_rate,
@@ -354,6 +420,7 @@ def main() -> None:
     print(f"Helix trainable params: {trainable:,}", flush=True)
 
     step = 0
+    micro_step = 0
     interrupted = False
 
     def _handle_stop(signum, frame):
@@ -369,7 +436,6 @@ def main() -> None:
         while step < args.max_steps and not interrupted:
             for batch in loader:
                 batch = {key: value.to(device) for key, value in batch.items()}
-                optimizer.zero_grad(set_to_none=True)
                 with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
                     out = helix_head_loss(
                         model,
@@ -377,12 +443,17 @@ def main() -> None:
                         router_loss_weight=args.router_loss_weight,
                         verifier_loss_weight=args.verifier_loss_weight,
                     )
-                out["loss"].backward()
+                    loss = out["loss"] / args.grad_accum_steps
+                loss.backward()
+                micro_step += 1
+                if micro_step % args.grad_accum_steps != 0:
+                    continue
                 torch.nn.utils.clip_grad_norm_(
                     [parameter for parameter in model.parameters() if parameter.requires_grad], 1.0
                 )
                 optimizer.step()
                 scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
                 step += 1
                 if step == 1 or step % args.log_every == 0:
                     print(
@@ -392,6 +463,19 @@ def main() -> None:
                         f"lr {scheduler.get_last_lr()[0]:.3e}",
                         flush=True,
                     )
+                    if eval_loader is not None:
+                        metrics = evaluate_helix_heads(
+                            model,
+                            eval_loader,
+                            device,
+                            args.router_loss_weight,
+                            args.verifier_loss_weight,
+                        )
+                        print(
+                            f"eval loss {metrics['loss']:.4f} router_acc {metrics['router_acc']:.3f} "
+                            f"verifier_acc {metrics['verifier_acc']:.3f}",
+                            flush=True,
+                        )
                 if args.save_every > 0 and step % args.save_every == 0:
                     save_checkpoint(model, tokenizer, args, Path(args.output_dir), step)
                 if step >= args.max_steps or interrupted:

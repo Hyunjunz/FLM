@@ -54,8 +54,14 @@ class HelixRuntimeState:
     easy_entropy: float = 0.65
     hard_entropy: float = 1.35
     short_prompt_tokens: int = 48
-    long_prompt_tokens: int = 384
+    long_prompt_tokens: int = 256
+    medium_prompt_tokens: int = 64
     default_top_k: int = 20
+    disable_early_exit_for_hard: bool = True
+    hard_full_depth: bool = True
+    verify_before_accept: bool = True
+    easy_exit_threshold: float = 0.45
+    medium_exit_threshold: float = 0.60
     cache_max_entries: int = 256
     use_trained_router: bool = False
     latent_cache: Dict[str, LatentEntry] = field(default_factory=dict)
@@ -66,8 +72,9 @@ class HelixDifficultyRouter:
     """CPU-latency-aware prompt router using cheap lexical features."""
 
     HARD_PATTERNS = re.compile(
-        r"\b(prove|derive|debug|optimi[sz]e|benchmark|counterexample|reason|"
-        r"수학|증명|추론|최적화|버그|코드|설계|분석)\b",
+        r"\b(prove|proof|derive|calculate|solve|reason|logic|algorithm|complexity|"
+        r"debug|bug|trace|step by step|counterexample|optimi[sz]e|benchmark)\b|"
+        r"(증명|계산|단계별|왜|반례|알고리즘|복잡도|디버그|버그|추론|논리|수식|코드|풀이)",
         re.IGNORECASE,
     )
 
@@ -76,11 +83,11 @@ class HelixDifficultyRouter:
         sentences = prompt.count(".") + prompt.count("?") + prompt.count("\n")
         hard_hits = len(self.HARD_PATTERNS.findall(prompt))
         score = 0
-        score += 2 if token_count >= 384 else 1 if token_count >= 96 else 0
+        score += 2 if token_count >= 256 else 1 if token_count >= 64 else 0
         score += 1 if operators >= 6 else 0
         score += 1 if sentences >= 6 else 0
-        score += min(2, hard_hits)
-        if score >= 4:
+        score += 3 if hard_hits else 0
+        if score >= 4 or (hard_hits and score >= 3):
             return "hard"
         if score >= 2:
             return "medium"
@@ -101,7 +108,8 @@ class HelixSparseExecutionController:
         if difficulty == "easy":
             return HelixRoute("easy_fast", early, min(requested_tokens, 48), 2, 0.10, 0.95, 1, True)
         if difficulty == "medium":
-            return HelixRoute("balanced", None, min(requested_tokens, 96), 3, 0.07, 1.25, 1, True)
+            late = max(0, min(self.num_layers - 1, (self.num_layers * 3) // 4))
+            return HelixRoute("balanced", late, min(requested_tokens, 128), 2, 0.08, 1.10, 1, False)
         return HelixRoute("deep_verify", None, requested_tokens, 2, 0.04, 1.55, 2, False)
 
 
@@ -139,6 +147,19 @@ class HelixVerifierCritic:
 
     def accept(self, confidence: float, margin: float, entropy: float, route: HelixRoute) -> bool:
         return margin >= route.verify_margin and entropy <= route.entropy_limit and confidence >= 0.45
+
+    def candidate_score(self, model: CPULiteForCausalLM, tokenizer, question: str, answer: str) -> Optional[float]:
+        if model.verifier_head is None:
+            return None
+        from .reasoning_data import format_verifier_prompt
+
+        ids = tokenizer.encode(format_verifier_prompt(question, answer)).ids
+        input_ids = torch.tensor([ids], dtype=torch.long, device=next(model.parameters()).device)
+        heads = model.carp_heads(input_ids)
+        if heads.verifier_logits is None:
+            return None
+        probs = F.softmax(heads.verifier_logits.float(), dim=-1)
+        return float(probs[:, 1].item()) if probs.size(-1) > 1 else None
 
 
 class HelixLatentReasoningCache:
@@ -303,6 +324,9 @@ class HelixMindRuntime:
         latent_hit = self.latent.retrieve(prompt, self.state)
         difficulty = self._classify_difficulty(prompt, input_ids)
         route = self.sparse.select_route(difficulty, max_new_tokens)
+        if difficulty == "hard" and self.state.hard_full_depth:
+            route = HelixRoute("hard_full_depth", None, max_new_tokens, 1, 0.04, 1.55, 1, False)
+            temperature = min(temperature, 0.3)
         kv_policy = self.kv.select_policy(len(encoded), difficulty, self.model.dtype)
         top_k = self.state.default_top_k if top_k is None else top_k
 
@@ -315,7 +339,9 @@ class HelixMindRuntime:
         draft_ids, score, verify_stats = self._generate_route(
             input_ids, route, kv_policy, route.max_new_tokens, temperature, top_k, eos_token_id
         )
-        accepted = self.verifier.accept(score, verify_stats["margin"], verify_stats["entropy"], route)
+        accepted = True
+        if self.state.verify_before_accept:
+            accepted = self.verifier.accept(score, verify_stats["margin"], verify_stats["entropy"], route)
         regen_count = 0
         while not accepted and regen_count < route.max_regens:
             regen_count += 1
@@ -326,10 +352,14 @@ class HelixMindRuntime:
             accepted = self.verifier.accept(score, verify_stats["margin"], verify_stats["entropy"], deeper)
 
         text = self.tokenizer.decode(draft_ids, skip_special_tokens=True)
+        verifier_score = self.verifier.candidate_score(self.model, self.tokenizer, prompt, text)
+        if verifier_score is not None:
+            self.state.stats["last_verifier_score"] = verifier_score
         self.latent.update(prompt, draft_ids, score, self.state)
         self.state.stats["last_confidence"] = score
         self.state.stats["last_regens"] = float(regen_count)
         self.state.stats["last_route_easy"] = 1.0 if route.name == "easy_fast" else 0.0
+        self.state.stats["last_difficulty"] = {"easy": 0.0, "medium": 1.0, "hard": 2.0}[difficulty]
         return text
 
 

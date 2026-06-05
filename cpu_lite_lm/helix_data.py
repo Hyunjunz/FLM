@@ -8,11 +8,31 @@ import random
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Tuple
 
+from .reasoning_data import make_hard_negative, parse_verifier_row
+
 
 HelixRow = Dict[str, Any]
 
 
 def normalize_helix_row(item: Dict[str, Any]) -> HelixRow | None:
+    verifier_row = parse_verifier_row(item)
+    if verifier_row is not None:
+        prompt = (
+            "### Question:\n"
+            f"{verifier_row['question']}\n\n"
+            "### Candidate Answer:\n"
+            f"{verifier_row['candidate_answer']}\n\n"
+            "### Is the candidate answer correct?\n"
+        )
+        row = {
+            "prompt": prompt,
+            "source": item.get("source", "verifier_jsonl"),
+            "verifier_label": verifier_row["verifier_label"],
+        }
+        if "difficulty" in item or "router_label" in item:
+            row["difficulty"] = item.get("difficulty", item.get("router_label"))
+        return row
+
     prompt = _extract_prompt(item)
     if not prompt:
         return None
@@ -30,16 +50,17 @@ def normalize_helix_row(item: Dict[str, Any]) -> HelixRow | None:
         else:
             difficulty = None
 
+    row: HelixRow = {
+        "prompt": prompt,
+        "source": item.get("source", "converted"),
+    }
     verifier = item.get("verifier_label")
     if verifier is None:
         verifier = item.get("accepted", item.get("correct", item.get("is_correct", None)))
-    accepted = True if verifier is None else bool(verifier)
-
-    row: HelixRow = {
-        "prompt": prompt,
-        "accepted": accepted,
-        "source": item.get("source", "converted"),
-    }
+    if verifier is not None:
+        label = _bool_label(verifier)
+        row["accepted"] = bool(label)
+        row["verifier_label"] = label
     if difficulty is not None:
         row["difficulty"] = difficulty
     if "weight" in item:
@@ -78,6 +99,12 @@ def _extract_prompt(item: Dict[str, Any]) -> str:
             if isinstance(value, str) and value.strip():
                 return f"{value.strip()}\n\nAnswer: {answer}"
     return ""
+
+
+def _bool_label(value: Any) -> int:
+    if isinstance(value, str):
+        return 1 if value.strip().lower() in {"1", "true", "yes", "correct", "accepted"} else 0
+    return 1 if bool(value) else 0
 
 
 def write_jsonl(rows: Iterable[HelixRow], output: str | Path) -> Path:
@@ -125,7 +152,9 @@ def summarize_helix_rows(rows: Iterable[HelixRow]) -> Dict[str, Dict[str, int]]:
         if difficulty not in {"easy", "medium", "hard"}:
             difficulty = "missing"
         summary["difficulty"][difficulty] += 1
-        summary["accepted"]["true" if bool(row.get("accepted", True)) else "false"] += 1
+        if "accepted" in row or "verifier_label" in row:
+            label = row.get("verifier_label", row.get("accepted"))
+            summary["accepted"]["true" if bool(label) else "false"] += 1
     return summary
 
 
@@ -159,8 +188,10 @@ def balance_helix_rows(
         balanced.extend(bucket[:max_per_difficulty])
     balanced.extend(missing[: max(0, max_per_difficulty // 4)])
 
-    true_rows = [row for row in balanced if bool(row.get("accepted", True))]
-    false_rows = [row for row in balanced if not bool(row.get("accepted", True))]
+    labeled = [row for row in balanced if "accepted" in row or "verifier_label" in row]
+    unlabeled = [row for row in balanced if row not in labeled]
+    true_rows = [row for row in labeled if bool(row.get("verifier_label", row.get("accepted")))]
+    false_rows = [row for row in labeled if not bool(row.get("verifier_label", row.get("accepted")))]
     if true_rows and false_rows:
         target_false = int(len(true_rows) * verifier_false_ratio / max(1e-9, 1.0 - verifier_false_ratio))
         if len(false_rows) > target_false:
@@ -168,7 +199,7 @@ def balance_helix_rows(
             false_rows = false_rows[:target_false]
         elif len(false_rows) < target_false:
             false_rows = false_rows + _build_extra_negative_rows(true_rows, target_false - len(false_rows), rng)
-        balanced = true_rows + false_rows
+        balanced = true_rows + false_rows + unlabeled
     rng.shuffle(balanced)
     return balanced
 
@@ -183,14 +214,14 @@ def _build_extra_negative_rows(rows: List[HelixRow], count: int, rng: random.Ran
     out = []
     for _ in range(count):
         src = rng.choice(rows)
-        out.append(
-            {
-                "prompt": f"{src['prompt']}\n\nDraft answer: {rng.choice(bad_claims)}\nIs the draft correct?",
-                "difficulty": src.get("difficulty", "medium"),
-                "accepted": False,
-                "source": f"{src.get('source', 'converted')}_balanced_negative",
-            }
-        )
+        bad = make_hard_negative(str(src["prompt"]), rng.choice(bad_claims))
+        out.append({
+            "prompt": f"{src['prompt']}\n\nDraft answer: {bad}\nIs the draft correct?",
+            "difficulty": src.get("difficulty", "medium"),
+            "accepted": False,
+            "verifier_label": 0,
+            "source": f"{src.get('source', 'converted')}_balanced_negative",
+        })
     return out
 
 

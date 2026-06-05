@@ -1,5 +1,172 @@
 # cpu_llm_lab
 
+## CPU-efficient reasoning model training
+
+This project keeps CPU inference as the deployment target, but the recommended
+training flow now separates base language modeling, reasoning SFT, verifier
+training, and fixed-set reasoning evaluation.
+
+Run the full default flow with:
+
+```bash
+bash scripts/run_reasoning_pipeline.sh
+```
+
+Important:
+
+Early-exit and speculative decoding are speed optimizations, not reasoning improvements. For hard reasoning tasks, use the reasoning preset or force full-depth decoding.
+
+Verifier must be trained with both correct and incorrect candidate answers. Missing labels should not be treated as positive labels.
+
+Reasoning tokens only help if they appear consistently in training data and runtime prompts.
+
+### Data mixture
+
+`scripts/prepare_700m_dataset.py` uses the following sample-level default mix:
+
+- general LM: 35%
+- instruction SFT: 20%
+- multiple-choice / commonsense / logic: 25%
+- CARP / verifier / preference-style data: 10%
+- math / code / debug reasoning: 10%
+
+If math/code reasoning data is unavailable, the script falls back to compact
+synthetic `Question / Plan / Solution / Answer` samples, including Korean
+reasoning examples.
+
+### Base train
+
+```bash
+python -m cpu_lite_lm.train \
+  --config configs/carp_700m.json \
+  --tokenizer artifacts/tokenizer \
+  --data data/train.jsonl \
+  --eval-data data/eval.jsonl \
+  --output-dir artifacts/base_ckpt \
+  --block-size 512 \
+  --batch-size 8 \
+  --grad-accum-steps 8 \
+  --learning-rate 2e-4 \
+  --eval-every 500 \
+  --eval-max-batches 20
+```
+
+### Reasoning SFT
+
+Plain reasoning mode is the recommended default. Latent reasoning tokens are an
+experimental mode and should only be used when the same tokens exist in both
+training data and runtime prompts.
+
+```bash
+python -m cpu_lite_lm.train_reasoning_sft \
+  --model artifacts/base_ckpt \
+  --tokenizer artifacts/tokenizer \
+  --data data/reasoning_sft.jsonl \
+  --eval-data data/reasoning_eval.jsonl \
+  --output-dir artifacts/reasoning_sft_ckpt \
+  --block-size 1024 \
+  --batch-size 4 \
+  --grad-accum-steps 8 \
+  --learning-rate 5e-5 \
+  --epochs 2
+```
+
+Reasoning SFT JSONL example:
+
+```json
+{"question":"철수는 사과 3개를 사고 2개를 더 샀다. 몇 개인가?","plan":"처음 개수와 추가 개수를 더한다.","solution":"3 + 2 = 5.","answer":"5"}
+```
+
+Latent token mode example:
+
+```json
+{"question":"12 * 13은?","reasoning_tokens":["<R0>","<R1>","<R64>"],"solution":"12 * 13 = 156.","answer":"156"}
+```
+
+### Verifier training
+
+The verifier is trained as `question + candidate_answer -> correct/incorrect`.
+Rows without a verifier label are skipped for verifier loss.
+
+```bash
+python -m cpu_lite_lm.train_verifier \
+  --model artifacts/reasoning_sft_ckpt \
+  --tokenizer artifacts/tokenizer \
+  --data data/verifier_train.jsonl \
+  --eval-data data/verifier_eval.jsonl \
+  --output-dir artifacts/verifier_ckpt \
+  --batch-size 8 \
+  --grad-accum-steps 4 \
+  --learning-rate 1e-4 \
+  --verifier-loss-weight 1.0
+```
+
+Verifier JSONL examples:
+
+```json
+{"question":"12 * 13은?","candidate_answer":"156","verifier_label":1}
+{"question":"12 * 13은?","candidate_answer":"166","verifier_label":0}
+{"prompt":"12 * 13은?","draft_answer":"156","accepted":true,"correct":true,"verifier_label":1}
+```
+
+### Inference presets
+
+```bash
+python -m cpu_lite_lm.generate \
+  --model artifacts/reasoning_sft_ckpt \
+  --tokenizer artifacts/tokenizer \
+  --prompt "단계별로 계산해줘: 12 * 13은?" \
+  --preset reasoning
+```
+
+- `fast`: router on, early-exit on, speculative on, max_new_tokens capped at 128.
+- `balanced`: router on, hard prompts use full-depth, easy prompts may use early-exit/speculative.
+- `reasoning`: full-depth, speculative off, early-exit off, temperature low, max_new_tokens at least 256.
+
+Do not use speculative decoding for math, code, debugging, proofs, algorithms,
+complexity analysis, logic puzzles, or prompts asking for step-by-step reasoning.
+
+### Evaluation
+
+`data/reasoning_eval.jsonl` should contain fixed rows like:
+
+```json
+{"id":"math_001","category":"math","question":"철수는 사과 3개를 사고 2개를 더 샀다. 몇 개인가?","answer":"5"}
+{"id":"code_001","category":"code_debug","question":"다음 Python 코드의 버그를 찾아라: for i in range(len(xs)+1): print(xs[i])","answer":"인덱스 범위 오류"}
+```
+
+Run:
+
+```bash
+python -m cpu_lite_lm.eval_reasoning \
+  --model artifacts/reasoning_sft_ckpt \
+  --tokenizer artifacts/tokenizer \
+  --data data/reasoning_eval.jsonl \
+  --route hard \
+  --full-depth \
+  --temperature 0.0 \
+  --max-new-tokens 256
+```
+
+The evaluator prints category accuracy, overall accuracy, average generation
+length, tokens/sec, decoding mode, and verifier accuracy when a verifier head is
+available.
+
+### MoE CPU caveats
+
+CPU 실사용 우선: dense 300M~700M + int8/int4 quant 권장.
+
+실험 우선: MoE 사용 가능하지만 top-1 routing과 expert 수 제한 권장.
+
+Use `--moe-top-k 1`, keep `--num-experts` small, and benchmark dense vs MoE:
+
+```bash
+python -m cpu_lite_lm.benchmark \
+  --model artifacts/reasoning_sft_ckpt \
+  --generated-tokens 64 \
+  --compare-dense-moe
+```
+
 `cpu_llm_lab` is a minimal, runnable CPU-only language model project. The model,
 `CPULiteLM`, is a small decoder-only Transformer with RMSNorm, RoPE, grouped
 query attention, SwiGLU, tied token embeddings, causal masking, and KV-cache

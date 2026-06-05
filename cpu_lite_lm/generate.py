@@ -35,7 +35,27 @@ def _amp_dtype(name: str):
     raise ValueError(f"Unsupported amp dtype: {name}")
 
 
+def apply_preset(args: argparse.Namespace) -> None:
+    if args.preset == "fast":
+        args.helix = True
+        args.speculative = True
+        args.max_new_tokens = min(args.max_new_tokens, 128)
+        args.temperature = args.temperature if args.temperature != 0.8 else 0.7
+    elif args.preset == "balanced":
+        args.helix = True
+        args.verify_before_accept = True
+        args.hard_full_depth = True
+    elif args.preset == "reasoning":
+        args.helix = False
+        args.speculative = False
+        args.no_cache = False
+        args.temperature = 0.0 if args.temperature == 0.8 else min(args.temperature, 0.3)
+        args.top_k = 0
+        args.max_new_tokens = max(args.max_new_tokens, 256)
+
+
 def generate(args: argparse.Namespace) -> str:
+    apply_preset(args)
     device = _resolve_device(args.device)
     if args.cpu_threads > 0:
         torch.set_num_threads(args.cpu_threads)
@@ -65,7 +85,15 @@ def generate(args: argparse.Namespace) -> str:
             runtime = HelixMindRuntime(
                 model,
                 tokenizer,
-                HelixRuntimeState(default_top_k=args.top_k, use_trained_router=args.helix_trained_router),
+                HelixRuntimeState(
+                    default_top_k=args.top_k,
+                    use_trained_router=args.helix_trained_router,
+                    hard_full_depth=args.hard_full_depth,
+                    verify_before_accept=args.verify_before_accept,
+                    disable_early_exit_for_hard=args.disable_early_exit_for_hard,
+                    easy_exit_threshold=args.easy_exit_threshold,
+                    medium_exit_threshold=args.medium_exit_threshold,
+                ),
             )
             generated_text = runtime.infer(
                 full_prompt,
@@ -117,6 +145,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-new-tokens", "--max_new_tokens", dest="max_new_tokens", type=int, default=20)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--top-p", type=float, default=1.0, help="Reserved for preset documentation; top-p sampling is not implemented")
+    parser.add_argument("--preset", choices=["fast", "balanced", "reasoning"], default="balanced")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp-dtype", choices=["off", "fp16", "bf16"], default="off")
@@ -126,6 +156,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lookahead", type=int, default=3, help="Number of tokens to speculate")
     parser.add_argument("--helix", action="store_true", help="Use HelixMind CPU reasoning runtime")
     parser.add_argument("--helix-trained-router", action="store_true", help="Use trained Helix router head")
+    parser.add_argument("--disable-early-exit-for-hard", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--hard-full-depth", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--verify-before-accept", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--easy-exit-threshold", type=float, default=0.45)
+    parser.add_argument("--medium-exit-threshold", type=float, default=0.60)
     return parser
 
 

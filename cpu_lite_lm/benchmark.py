@@ -10,6 +10,7 @@ import psutil
 import torch
 
 from .generate import load_model
+from .modeling_cpu_lite import CPULiteForCausalLM
 
 
 def rss_mb() -> float:
@@ -21,6 +22,13 @@ def benchmark(args: argparse.Namespace) -> None:
         torch.set_num_threads(args.threads)
         torch.set_num_interop_threads(max(1, min(2, args.threads)))
     model = load_model(args.model, args.config).eval()
+    if args.disable_moe_for_small_model and model.config.hidden_size <= args.small_model_hidden_threshold:
+        model.config.num_experts = 0
+        model.config.num_experts_per_tok = 0
+        model = CPULiteForCausalLM(model.config).eval()
+        print("MoE disabled for small-model CPU benchmark.")
+    if args.moe_top_k > 0 and getattr(model.config, "num_experts", 0) > 0:
+        model.config.num_experts_per_tok = args.moe_top_k
     input_ids = torch.randint(4, model.config.vocab_size, (1, args.prompt_tokens), dtype=torch.long)
     max_len = args.prompt_tokens + args.generated_tokens
     past = model.allocate_kv_cache(1, max_len) if args.use_cache else None
@@ -64,6 +72,16 @@ def benchmark(args: argparse.Namespace) -> None:
     print(f"Decode tok/s: {decode:.2f}")
     print(f"RSS memory MB: {rss_mb():.2f}")
     print(f"Use cache: {str(args.use_cache).lower()}")
+    print(f"MoE experts: {getattr(model.config, 'num_experts', 0)}")
+    print(f"MoE top-k: {getattr(model.config, 'num_experts_per_tok', 0)}")
+
+    if args.compare_dense_moe and getattr(model.config, "num_experts", 0) > 0:
+        dense_cfg = model.config
+        dense_cfg.num_experts = 0
+        dense_cfg.num_experts_per_tok = 0
+        dense_model = CPULiteForCausalLM(dense_cfg).eval()
+        dense_decode = _decode_tokens_per_sec(dense_model, args)
+        print(f"Dense random-init decode tok/s: {dense_decode:.2f}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -75,7 +93,27 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--generated-tokens", type=int, default=64)
     parser.add_argument("--use-cache", action="store_true", default=True)
     parser.add_argument("--no-cache", dest="use_cache", action="store_false")
+    parser.add_argument("--moe-top-k", type=int, default=1)
+    parser.add_argument("--num-experts", type=int, default=4, help="Documentation default for CPU MoE experiments")
+    parser.add_argument("--disable-moe-for-small-model", action="store_true")
+    parser.add_argument("--small-model-hidden-threshold", type=int, default=512)
+    parser.add_argument("--compare-dense-moe", action="store_true")
     return parser
+
+
+def _decode_tokens_per_sec(model, args: argparse.Namespace) -> float:
+    input_ids = torch.randint(4, model.config.vocab_size, (1, args.prompt_tokens), dtype=torch.long)
+    with torch.inference_mode():
+        t0 = time.perf_counter()
+        _ = model.generate_simple(
+            input_ids,
+            max_new_tokens=args.generated_tokens,
+            temperature=0.0,
+            use_cache=args.use_cache,
+            eos_token_id=None,
+        )
+        t1 = time.perf_counter()
+    return args.generated_tokens / max(t1 - t0, 1e-9)
 
 
 def main() -> None:

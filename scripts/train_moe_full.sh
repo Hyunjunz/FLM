@@ -45,12 +45,12 @@ python -m cpu_lite_lm.train \
     --vocab-size $((VOCAB_SIZE + REASONING_TOKENS + 10)) \
     --streaming \
     --shuffle-buffer 5000 \
-    --block-size 256 \
+    --block-size 512 \
     --max-docs -1 \
     --max-chars -1 \
-    --batch-size 16 \
-    --grad-accum-steps 4 \
-    --learning-rate 3e-4 \
+    --batch-size 8 \
+    --grad-accum-steps 8 \
+    --learning-rate 2e-4 \
     --weight-decay 0.1 \
     --log-every 10 \
     --save-every 1000 \
