@@ -15,7 +15,7 @@ from torch.utils.data import DataLoader, Dataset
 
 from .configuration_cpu_lite import CPULiteConfig
 from .generate import load_model
-from .helix_data import convert_jsonl_to_helix, normalize_helix_row, prepare_helix_dataset
+from .helix_data import convert_jsonl_to_helix, normalize_helix_row, prepare_helix_dataset, print_helix_summary
 from .helix_runtime import HelixDifficultyRouter
 from .modeling_cpu_lite import CPULiteForCausalLM
 from .tokenizer_train import load_tokenizer, train_tokenizer
@@ -196,12 +196,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tokenizer-max-docs", type=int, default=50000)
     parser.add_argument(
         "--download-preset",
-        choices=["reasoning_mix", "small_reasoning", "synthetic"],
-        default="reasoning_mix",
+        choices=["big_reasoning", "balanced_reasoning", "reasoning_mix", "small_reasoning", "synthetic"],
+        default="big_reasoning",
     )
+    parser.add_argument("--force-download", action="store_true", help="Rebuild --data even when it already exists")
     parser.add_argument("--download-max-examples", type=int, default=2000, help="Examples per HF dataset")
     parser.add_argument("--download-cache-dir", default="data/hf_cache")
     parser.add_argument("--synthetic-examples", type=int, default=1000)
+    parser.add_argument("--no-balance-data", action="store_true")
+    parser.add_argument("--max-per-difficulty", type=int, default=12000)
     parser.add_argument("--model", default="artifacts/micro_ckpt")
     parser.add_argument("--config", default="configs/micro.json")
     parser.add_argument("--tokenizer", default="")
@@ -229,7 +232,7 @@ def main() -> None:
         torch.set_num_interop_threads(max(1, min(2, args.cpu_threads)))
 
     data_path = Path(args.data)
-    if args.auto_download and not data_path.exists():
+    if args.auto_download and (args.force_download or not data_path.exists()):
         prepare_helix_dataset(
             data_path,
             preset=args.download_preset,
@@ -237,6 +240,8 @@ def main() -> None:
             cache_dir=args.download_cache_dir,
             synthetic_examples=args.synthetic_examples,
             seed=args.seed,
+            balance=not args.no_balance_data,
+            max_per_difficulty=args.max_per_difficulty,
         )
     if not data_path.exists():
         raise FileNotFoundError(
@@ -274,6 +279,14 @@ def main() -> None:
     model.to(device).train()
 
     dataset = HelixJsonlDataset(data_path, tokenizer, block_size=args.block_size)
+    raw_rows = [
+        {
+            "difficulty": ("easy", "medium", "hard")[row["router_label"]],
+            "accepted": bool(row["verifier_label"]),
+        }
+        for row in dataset.rows
+    ]
+    print_helix_summary(raw_rows, "Helix train split")
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,

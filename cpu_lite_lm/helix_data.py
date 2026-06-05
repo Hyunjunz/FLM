@@ -94,6 +94,85 @@ def write_jsonl(rows: Iterable[HelixRow], output: str | Path) -> Path:
     return output
 
 
+def summarize_helix_rows(rows: Iterable[HelixRow]) -> Dict[str, Dict[str, int]]:
+    summary = {
+        "difficulty": {"easy": 0, "medium": 0, "hard": 0, "missing": 0},
+        "accepted": {"true": 0, "false": 0},
+    }
+    for row in rows:
+        difficulty = str(row.get("difficulty", "missing")).lower()
+        if difficulty not in {"easy", "medium", "hard"}:
+            difficulty = "missing"
+        summary["difficulty"][difficulty] += 1
+        summary["accepted"]["true" if bool(row.get("accepted", True)) else "false"] += 1
+    return summary
+
+
+def print_helix_summary(rows: List[HelixRow], title: str = "Helix data") -> None:
+    summary = summarize_helix_rows(rows)
+    print(
+        f"{title}: rows={len(rows)} "
+        f"difficulty={summary['difficulty']} accepted={summary['accepted']}",
+        flush=True,
+    )
+
+
+def balance_helix_rows(
+    rows: List[HelixRow],
+    max_per_difficulty: int = 12000,
+    verifier_false_ratio: float = 0.5,
+    seed: int = 1234,
+) -> List[HelixRow]:
+    rng = random.Random(seed)
+    buckets: Dict[str, List[HelixRow]] = {"easy": [], "medium": [], "hard": []}
+    missing: List[HelixRow] = []
+    for row in rows:
+        difficulty = str(row.get("difficulty", "")).lower()
+        if difficulty in buckets:
+            buckets[difficulty].append(row)
+        else:
+            missing.append(row)
+    balanced: List[HelixRow] = []
+    for difficulty, bucket in buckets.items():
+        rng.shuffle(bucket)
+        balanced.extend(bucket[:max_per_difficulty])
+    balanced.extend(missing[: max(0, max_per_difficulty // 4)])
+
+    true_rows = [row for row in balanced if bool(row.get("accepted", True))]
+    false_rows = [row for row in balanced if not bool(row.get("accepted", True))]
+    if true_rows and false_rows:
+        target_false = int(len(true_rows) * verifier_false_ratio / max(1e-9, 1.0 - verifier_false_ratio))
+        if len(false_rows) > target_false:
+            rng.shuffle(false_rows)
+            false_rows = false_rows[:target_false]
+        elif len(false_rows) < target_false:
+            false_rows = false_rows + _build_extra_negative_rows(true_rows, target_false - len(false_rows), rng)
+        balanced = true_rows + false_rows
+    rng.shuffle(balanced)
+    return balanced
+
+
+def _build_extra_negative_rows(rows: List[HelixRow], count: int, rng: random.Random) -> List[HelixRow]:
+    bad_claims = [
+        "The draft gives an unsupported exact fact. Mark whether it is correct.",
+        "The draft contradicts the question. Mark whether it is correct.",
+        "The draft skips the required condition and reaches the wrong conclusion.",
+        "The draft uses a wrong arithmetic step. Mark whether it is correct.",
+    ]
+    out = []
+    for _ in range(count):
+        src = rng.choice(rows)
+        out.append(
+            {
+                "prompt": f"{src['prompt']}\n\nDraft answer: {rng.choice(bad_claims)}\nIs the draft correct?",
+                "difficulty": src.get("difficulty", "medium"),
+                "accepted": False,
+                "source": f"{src.get('source', 'converted')}_balanced_negative",
+            }
+        )
+    return out
+
+
 def convert_jsonl_to_helix(input_path: str | Path, output_path: str | Path) -> Path:
     input_path = Path(input_path)
     converted: List[HelixRow] = []
@@ -174,13 +253,13 @@ def _commonsense_qa(row: Dict[str, Any]) -> List[HelixRow]:
     choices = [f"{label}. {text}" for label, text in zip(labels, texts)]
     answer = str(row.get("answerKey", "")).strip()
     prompt = _choice_prompt(str(row["question"]), choices, "Choose the best commonsense answer.")
-    rows = [{"prompt": prompt, "difficulty": "hard", "accepted": True, "source": "tau/commonsense_qa"}]
+    rows = [{"prompt": prompt, "difficulty": "medium", "accepted": True, "source": "tau/commonsense_qa"}]
     wrong = next((choice for choice in choices if not choice.startswith(f"{answer}.")), "")
     if wrong:
         rows.append(
             {
                 "prompt": f"{prompt}\n\nDraft answer: {wrong}\nIs the draft correct?",
-                "difficulty": "hard",
+                "difficulty": "medium",
                 "accepted": False,
                 "source": "tau/commonsense_qa_negative",
             }
@@ -195,11 +274,12 @@ def _boolq(row: Dict[str, Any]) -> List[HelixRow]:
     )
     gold = "yes" if bool(row["answer"]) else "no"
     wrong = "no" if gold == "yes" else "yes"
+    difficulty = "hard" if len(str(row["passage"]).split()) > 140 else "medium"
     return [
-        {"prompt": prompt, "difficulty": "hard", "accepted": True, "source": "google/boolq"},
+        {"prompt": prompt, "difficulty": difficulty, "accepted": True, "source": "google/boolq"},
         {
             "prompt": f"{prompt}\n\nDraft answer: {wrong}\nIs the draft correct?",
-            "difficulty": "hard",
+            "difficulty": difficulty,
             "accepted": False,
             "source": "google/boolq_negative",
         },
@@ -215,10 +295,10 @@ def _hellaswag(row: Dict[str, Any]) -> List[HelixRow]:
     prompt = _choice_prompt(context, choices, "Choose the most plausible continuation.")
     wrong = choices[(gold_idx + 1) % len(choices)]
     return [
-        {"prompt": prompt, "difficulty": "hard", "accepted": True, "source": "Rowan/hellaswag"},
+        {"prompt": prompt, "difficulty": "medium", "accepted": True, "source": "Rowan/hellaswag"},
         {
             "prompt": f"{prompt}\n\nDraft answer: {wrong}\nIs the draft correct?",
-            "difficulty": "hard",
+            "difficulty": "medium",
             "accepted": False,
             "source": "Rowan/hellaswag_negative",
         },
@@ -232,12 +312,13 @@ def _arc(row: Dict[str, Any], source: str) -> List[HelixRow]:
     answer = str(row["answerKey"]).strip()
     prompt = _choice_prompt(str(row["question"]), choices)
     wrong = next((choice for choice in choices if not choice.startswith(f"{answer}.")), "")
-    rows = [{"prompt": prompt, "difficulty": "hard", "accepted": True, "source": source}]
+    difficulty = "hard" if "Challenge" in source else "medium"
+    rows = [{"prompt": prompt, "difficulty": difficulty, "accepted": True, "source": source}]
     if wrong:
         rows.append(
             {
                 "prompt": f"{prompt}\n\nDraft answer: {wrong}\nIs the draft correct?",
-                "difficulty": "hard",
+                "difficulty": difficulty,
                 "accepted": False,
                 "source": f"{source}_negative",
             }
@@ -254,17 +335,112 @@ def _openbookqa(row: Dict[str, Any]) -> List[HelixRow]:
     prompt = _choice_prompt((f"Fact: {fact}\n\n" if fact else "") + question, choices)
     answer = str(row["answerKey"]).strip()
     wrong = next((choice for choice in choices if not choice.startswith(f"{answer}.")), "")
-    rows = [{"prompt": prompt, "difficulty": "hard", "accepted": True, "source": "allenai/openbookqa"}]
+    rows = [{"prompt": prompt, "difficulty": "medium", "accepted": True, "source": "allenai/openbookqa"}]
     if wrong:
         rows.append(
             {
                 "prompt": f"{prompt}\n\nDraft answer: {wrong}\nIs the draft correct?",
-                "difficulty": "hard",
+                "difficulty": "medium",
                 "accepted": False,
                 "source": "allenai/openbookqa_negative",
             }
         )
     return rows
+
+
+def _gsm8k(row: Dict[str, Any]) -> List[HelixRow]:
+    question = str(row["question"])
+    answer = str(row["answer"])
+    prompt = f"Solve the grade-school math problem step by step.\n\nQuestion: {question}"
+    wrong = "The answer is 0 because no calculation is needed."
+    return [
+        {"prompt": f"{prompt}\n\nReference answer:\n{answer}", "difficulty": "hard", "accepted": True, "source": "gsm8k"},
+        {
+            "prompt": f"{prompt}\n\nDraft answer: {wrong}\nIs the draft correct?",
+            "difficulty": "hard",
+            "accepted": False,
+            "source": "gsm8k_negative",
+        },
+    ]
+
+
+def _piqa(row: Dict[str, Any]) -> List[HelixRow]:
+    goal = str(row["goal"])
+    choices = [f"A. {row['sol1']}", f"B. {row['sol2']}"]
+    gold = int(row["label"])
+    wrong = choices[1 - gold]
+    prompt = _choice_prompt(goal, choices, "Choose the physically plausible solution.")
+    return [
+        {"prompt": prompt, "difficulty": "medium", "accepted": True, "source": "piqa"},
+        {
+            "prompt": f"{prompt}\n\nDraft answer: {wrong}\nIs the draft correct?",
+            "difficulty": "medium",
+            "accepted": False,
+            "source": "piqa_negative",
+        },
+    ]
+
+
+def _winogrande(row: Dict[str, Any]) -> List[HelixRow]:
+    sentence = str(row["sentence"])
+    choices = [f"A. {row['option1']}", f"B. {row['option2']}"]
+    answer = str(row["answer"]).strip()
+    wrong = choices[1 if answer == "1" else 0]
+    prompt = _choice_prompt(sentence, choices, "Choose the option that correctly fills the blank.")
+    return [
+        {"prompt": prompt, "difficulty": "medium", "accepted": True, "source": "winogrande"},
+        {
+            "prompt": f"{prompt}\n\nDraft answer: {wrong}\nIs the draft correct?",
+            "difficulty": "medium",
+            "accepted": False,
+            "source": "winogrande_negative",
+        },
+    ]
+
+
+def _race(row: Dict[str, Any]) -> List[HelixRow]:
+    options = [str(option) for option in row["options"]]
+    labels = ["A", "B", "C", "D"]
+    choices = [f"{label}. {option}" for label, option in zip(labels, options)]
+    answer = str(row["answer"]).strip()
+    wrong = next((choice for choice in choices if not choice.startswith(f"{answer}.")), choices[0])
+    prompt = (
+        "Answer the reading comprehension question using the article.\n\n"
+        f"Article: {row['article']}\n\nQuestion: {row['question']}\n\nChoices:\n"
+        + "\n".join(choices)
+    )
+    return [
+        {"prompt": prompt, "difficulty": "hard", "accepted": True, "source": "race"},
+        {
+            "prompt": f"{prompt}\n\nDraft answer: {wrong}\nIs the draft correct?",
+            "difficulty": "hard",
+            "accepted": False,
+            "source": "race_negative",
+        },
+    ]
+
+
+def _sciq(row: Dict[str, Any]) -> List[HelixRow]:
+    choices = [
+        f"A. {row['correct_answer']}",
+        f"B. {row['distractor1']}",
+        f"C. {row['distractor2']}",
+        f"D. {row['distractor3']}",
+    ]
+    prompt = (
+        "Choose the correct science answer.\n\n"
+        f"Support: {row.get('support', '')}\n\nQuestion: {row['question']}\n\nChoices:\n"
+        + "\n".join(choices)
+    )
+    return [
+        {"prompt": prompt, "difficulty": "medium", "accepted": True, "source": "sciq"},
+        {
+            "prompt": f"{prompt}\n\nDraft answer: {choices[1]}\nIs the draft correct?",
+            "difficulty": "medium",
+            "accepted": False,
+            "source": "sciq_negative",
+        },
+    ]
 
 
 HF_PRESETS: Dict[str, List[Tuple[str, str | None, str, Callable[[Dict[str, Any]], List[HelixRow]]]]] = {
@@ -280,6 +456,27 @@ HF_PRESETS: Dict[str, List[Tuple[str, str | None, str, Callable[[Dict[str, Any]]
         ("tau/commonsense_qa", None, "train", _commonsense_qa),
         ("google/boolq", None, "train", _boolq),
         ("allenai/ai2_arc", "ARC-Easy", "train", lambda row: _arc(row, "allenai/ai2_arc/ARC-Easy")),
+    ],
+    "balanced_reasoning": [
+        ("tau/commonsense_qa", None, "train", _commonsense_qa),
+        ("google/boolq", None, "train", _boolq),
+        ("Rowan/hellaswag", None, "train", _hellaswag),
+        ("allenai/ai2_arc", "ARC-Challenge", "train", lambda row: _arc(row, "allenai/ai2_arc/ARC-Challenge")),
+        ("allenai/ai2_arc", "ARC-Easy", "train", lambda row: _arc(row, "allenai/ai2_arc/ARC-Easy")),
+        ("allenai/openbookqa", "main", "train", _openbookqa),
+    ],
+    "big_reasoning": [
+        ("tau/commonsense_qa", None, "train", _commonsense_qa),
+        ("google/boolq", None, "train", _boolq),
+        ("Rowan/hellaswag", None, "train", _hellaswag),
+        ("allenai/ai2_arc", "ARC-Challenge", "train", lambda row: _arc(row, "allenai/ai2_arc/ARC-Challenge")),
+        ("allenai/ai2_arc", "ARC-Easy", "train", lambda row: _arc(row, "allenai/ai2_arc/ARC-Easy")),
+        ("allenai/openbookqa", "main", "train", _openbookqa),
+        ("gsm8k", "main", "train", _gsm8k),
+        ("piqa", None, "train", _piqa),
+        ("winogrande", "winogrande_xl", "train", _winogrande),
+        ("race", "all", "train", _race),
+        ("sciq", None, "train", _sciq),
     ],
 }
 
@@ -309,6 +506,8 @@ def prepare_helix_dataset(
     cache_dir: str | None = None,
     synthetic_examples: int = 0,
     seed: int = 1234,
+    balance: bool = True,
+    max_per_difficulty: int = 12000,
 ) -> Path:
     if preset == "synthetic":
         rows = build_synthetic_helix_rows(max_examples_per_dataset, seed)
@@ -316,4 +515,8 @@ def prepare_helix_dataset(
         rows = build_hf_helix_rows(preset, max_examples_per_dataset, cache_dir)
         if synthetic_examples > 0:
             rows.extend(build_synthetic_helix_rows(synthetic_examples, seed))
+    print_helix_summary(rows, "Helix data before balance")
+    if balance:
+        rows = balance_helix_rows(rows, max_per_difficulty=max_per_difficulty, seed=seed)
+        print_helix_summary(rows, "Helix data after balance")
     return write_jsonl(rows, output)
