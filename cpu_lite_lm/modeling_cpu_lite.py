@@ -104,6 +104,70 @@ def rotate_half(x: torch.Tensor) -> torch.Tensor:
 def apply_rotary_pos_emb(
     q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # q/k layout: [B, H, T, D]
+    bsz, _, seq_len, head_dim = q.shape
+
+    def fix_freq(x: torch.Tensor) -> torch.Tensor:
+        # Common incoming shapes:
+        # [T, D]
+        # [B, T, D]
+        # [B, T, 1, D]
+        # [B, 1, T, D]
+        # [1, B, T, D]
+        x = x.to(device=q.device, dtype=q.dtype)
+
+        if x.dim() == 2:
+            # [T, D] -> [1, 1, T, D]
+            x = x.unsqueeze(0).unsqueeze(0)
+
+        elif x.dim() == 3:
+            # [B, T, D] -> [B, 1, T, D]
+            if x.shape[0] == bsz and x.shape[1] == seq_len:
+                x = x.unsqueeze(1)
+            # [T, B, D] -> [B, 1, T, D]
+            elif x.shape[0] == seq_len and x.shape[1] == bsz:
+                x = x.transpose(0, 1).unsqueeze(1)
+            # [1, T, D] -> [1, 1, T, D]
+            elif x.shape[0] == 1 and x.shape[1] == seq_len:
+                x = x.unsqueeze(1)
+            else:
+                raise RuntimeError(f"Unsupported RoPE freq 3D shape {tuple(x.shape)} for q {tuple(q.shape)}")
+
+        elif x.dim() == 4:
+            # [B, T, 1, D] -> [B, 1, T, D]
+            if x.shape[0] == bsz and x.shape[1] == seq_len and x.shape[2] == 1:
+                x = x.transpose(1, 2)
+            # [B, 1, T, D] already OK
+            elif x.shape[0] == bsz and x.shape[1] == 1 and x.shape[2] == seq_len:
+                pass
+            # [1, B, T, D] -> [B, 1, T, D]
+            elif x.shape[0] == 1 and x.shape[1] == bsz and x.shape[2] == seq_len:
+                x = x.squeeze(0).unsqueeze(1)
+            # [1, 1, T, D] already OK
+            elif x.shape[0] == 1 and x.shape[1] == 1 and x.shape[2] == seq_len:
+                pass
+            else:
+                raise RuntimeError(f"Unsupported RoPE freq 4D shape {tuple(x.shape)} for q {tuple(q.shape)}")
+
+        elif x.dim() == 5:
+            # Observed broken shape: [1, 1, B, T, D]
+            # Convert to [B, 1, T, D].
+            if x.shape[0] == 1 and x.shape[1] == 1 and x.shape[2] == bsz and x.shape[3] == seq_len:
+                x = x.squeeze(0).squeeze(0).unsqueeze(1)
+            # Or [1, 1, 1, T, D] -> [1, 1, T, D]
+            elif x.shape[0] == 1 and x.shape[1] == 1 and x.shape[2] == 1 and x.shape[3] == seq_len:
+                x = x.squeeze(0).squeeze(0)
+            else:
+                raise RuntimeError(f"Unsupported RoPE freq 5D shape {tuple(x.shape)} for q {tuple(q.shape)}")
+
+        else:
+            raise RuntimeError(f"Unsupported RoPE freq shape {tuple(x.shape)} for q {tuple(q.shape)}")
+
+        return x
+
+    cos = fix_freq(cos)
+    sin = fix_freq(sin)
+
     return (q * cos) + (rotate_half(q) * sin), (k * cos) + (rotate_half(k) * sin)
 
 
