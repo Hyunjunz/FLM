@@ -53,6 +53,10 @@ class CPULiteConfig(PretrainedConfig):
         tie_word_embeddings: bool = True,
         use_sdpa: bool = True,
         initializer_range: float = 0.02,
+        num_experts: int = 0,
+        num_experts_per_tok: int = 0,
+        moe_capacity_factor: float = 1.0,
+        moe_loss_weight: float = 0.01,
         carp_num_reasoning_tokens: int = 0,
         carp_router_labels: int = 0,
         carp_verifier_labels: int = 0,
@@ -80,6 +84,10 @@ class CPULiteConfig(PretrainedConfig):
         self.tie_word_embeddings = tie_word_embeddings
         self.use_sdpa = use_sdpa
         self.initializer_range = initializer_range
+        self.num_experts = num_experts
+        self.num_experts_per_tok = num_experts_per_tok
+        self.moe_capacity_factor = moe_capacity_factor
+        self.moe_loss_weight = moe_loss_weight
         self.carp_num_reasoning_tokens = carp_num_reasoning_tokens
         self.carp_router_labels = carp_router_labels
         self.carp_verifier_labels = carp_verifier_labels

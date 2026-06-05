@@ -47,6 +47,7 @@ class CPULiteCausalLMOutput:
     loss: Optional[torch.Tensor]
     logits: torch.Tensor
     past_key_values: Optional[List[PastKeyValue]]
+    moe_loss: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -64,6 +65,7 @@ class CPULiteRMSNorm(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype = x.dtype
         x_float = x.float()
+        # Fast path for CPU: avoid unnecessary copies if possible
         var = x_float.pow(2).mean(dim=-1, keepdim=True)
         return (x_float * torch.rsqrt(var + self.eps)).to(dtype) * self.weight
 
@@ -87,16 +89,15 @@ class CPULiteRotaryEmbedding(nn.Module):
         max_pos = int(position_ids.max().item()) + 1
         if max_pos > self.cos_cached.size(2):
             self._set_cache(max_pos)
-        cos = self.cos_cached.to(device=x.device, dtype=x.dtype)
-        sin = self.sin_cached.to(device=x.device, dtype=x.dtype)
-        cos = cos[0, 0, position_ids, :].unsqueeze(1)
-        sin = sin[0, 0, position_ids, :].unsqueeze(1)
-        return cos, sin
+        
+        # Avoid repeated to() calls if possible
+        cos = self.cos_cached.narrow(2, 0, max_pos)[:, :, position_ids, :]
+        sin = self.sin_cached.narrow(2, 0, max_pos)[:, :, position_ids, :]
+        return cos.to(x.dtype), sin.to(x.dtype)
 
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
+    x1, x2 = x.chunk(2, dim=-1)
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -125,7 +126,7 @@ class CPULiteAttention(nn.Module):
 
     def _shape(self, x: torch.Tensor, heads: int) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
-        return x.view(bsz, seq_len, heads, self.head_dim).transpose(1, 2).contiguous()
+        return x.view(bsz, seq_len, heads, self.head_dim).transpose(1, 2)
 
     def forward(
         self,
@@ -145,8 +146,6 @@ class CPULiteAttention(nn.Module):
 
         if past_key_value is not None:
             if cache_position is not None:
-                # Optimized static KV cache update
-                # Use .to() to ensure dtype matches even with autocast
                 past_key_value[0][:, :, cache_position] = key.to(past_key_value[0].dtype)
                 past_key_value[1][:, :, cache_position] = value.to(past_key_value[1].dtype)
                 key = past_key_value[0][:, :, :cache_position[-1] + 1]
@@ -164,9 +163,7 @@ class CPULiteAttention(nn.Module):
             key_for_attn = key
             value_for_attn = value
 
-        kv_len = key_for_attn.size(-2)
         if self.use_sdpa and hasattr(F, "scaled_dot_product_attention"):
-            # When using cache_position, we can optimize the mask
             attn_output = F.scaled_dot_product_attention(
                 query,
                 key_for_attn,
@@ -176,6 +173,7 @@ class CPULiteAttention(nn.Module):
                 is_causal=attention_mask is None and q_len > 1,
             )
         else:
+            kv_len = key_for_attn.size(-2)
             attn_weights = torch.matmul(query, key_for_attn.transpose(-2, -1)) / math.sqrt(self.head_dim)
             if attention_mask is not None:
                 attn_weights = attn_weights + attention_mask
@@ -195,7 +193,6 @@ class CPULiteAttention(nn.Module):
         return self.o_proj(attn_output), present
 
 
-
 class CPULiteMLP(nn.Module):
     def __init__(self, config: CPULiteConfig) -> None:
         super().__init__()
@@ -207,13 +204,70 @@ class CPULiteMLP(nn.Module):
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 
+class CPULiteMoE(nn.Module):
+    """Mixture of Experts for CPULiteLM."""
+    def __init__(self, config: CPULiteConfig) -> None:
+        super().__init__()
+        self.num_experts = config.num_experts
+        self.num_experts_per_tok = config.num_experts_per_tok
+        self.hidden_size = config.hidden_size
+        
+        self.router = nn.Linear(config.hidden_size, self.num_experts, bias=False)
+        self.experts = nn.ModuleList([CPULiteMLP(config) for _ in range(self.num_experts)])
+        self.moe_loss_weight = config.moe_loss_weight
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        bsz, seq_len, hidden_dim = x.shape
+        flat_x = x.view(-1, hidden_dim)
+        
+        router_logits = self.router(flat_x)
+        routing_weights = F.softmax(router_logits, dim=-1)
+        
+        # Load balancing loss (auxiliary loss)
+        # Based on Switch Transformer / GShard
+        probs = routing_weights.mean(dim=0)
+        # Fraction of tokens assigned to each expert
+        _, selected_experts = torch.topk(router_logits, self.num_experts_per_tok, dim=-1)
+        expert_mask = F.one_hot(selected_experts, self.num_experts).float()
+        density = expert_mask.mean(dim=(0, 1))
+        aux_loss = self.num_experts * torch.sum(probs * density)
+        
+        # Top-k routing
+        weights, selected_experts = torch.topk(routing_weights, self.num_experts_per_tok, dim=-1)
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+        
+        results = torch.zeros_like(flat_x)
+        for i, expert in enumerate(self.experts):
+            # Mask for tokens that chose this expert
+            mask = (selected_experts == i).any(dim=-1)
+            if not mask.any():
+                continue
+            
+            expert_input = flat_x[mask]
+            expert_output = expert(expert_input)
+            
+            # Find the weight assigned to this expert for each token
+            # Note: a token might have selected this expert in any of the top-k slots
+            expert_weights = (selected_experts[mask] == i).float() * weights[mask]
+            # Sum weights if multiple slots selected same expert (unlikely with top-k unique but safe)
+            combined_weight = expert_weights.sum(dim=-1, keepdim=True)
+            
+            results[mask] += combined_weight * expert_output
+            
+        return results.view(bsz, seq_len, hidden_dim), aux_loss
+
+
 class CPULiteDecoderLayer(nn.Module):
     def __init__(self, config: CPULiteConfig) -> None:
         super().__init__()
         self.input_layernorm = CPULiteRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.self_attn = CPULiteAttention(config)
         self.post_attention_layernorm = CPULiteRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.mlp = CPULiteMLP(config)
+        
+        if config.num_experts > 0:
+            self.mlp = CPULiteMoE(config)
+        else:
+            self.mlp = CPULiteMLP(config)
 
     def forward(
         self,
@@ -223,7 +277,7 @@ class CPULiteDecoderLayer(nn.Module):
         past_key_value: Optional[PastKeyValue],
         use_cache: bool,
         cache_position: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[PastKeyValue]]:
+    ) -> Tuple[torch.Tensor, Optional[PastKeyValue], torch.Tensor]:
         residual = hidden_states
         attn_out, present = self.self_attn(
             self.input_layernorm(hidden_states),
@@ -234,8 +288,18 @@ class CPULiteDecoderLayer(nn.Module):
             cache_position,
         )
         hidden_states = residual + attn_out
-        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
-        return hidden_states, present
+        
+        residual = hidden_states
+        mlp_out = self.mlp(self.post_attention_layernorm(hidden_states))
+        
+        moe_loss = torch.zeros((), device=hidden_states.device)
+        if isinstance(mlp_out, tuple):
+            mlp_hidden, moe_loss = mlp_out
+            hidden_states = residual + mlp_hidden
+        else:
+            hidden_states = residual + mlp_out
+            
+        return hidden_states, present, moe_loss
 
 
 class CPULitePreTrainedModel(PreTrainedModel):
@@ -246,6 +310,8 @@ class CPULitePreTrainedModel(PreTrainedModel):
     def _init_weights(self, module: nn.Module) -> None:
         if isinstance(module, nn.Linear):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
 
@@ -292,10 +358,9 @@ class CPULiteModel(CPULitePreTrainedModel):
         past_key_values: Optional[List[PastKeyValue]] = None,
         use_cache: bool = False,
         cache_position: Optional[torch.Tensor] = None,
-        early_exit_threshold: Optional[float] = None,
         output_layer: Optional[int] = None,
         return_hidden_states: bool = False,
-    ) -> Tuple[torch.Tensor, Optional[List[PastKeyValue]], Optional[int], Optional[List[torch.Tensor]]]:
+    ) -> Tuple[torch.Tensor, Optional[List[PastKeyValue]], Optional[int], Optional[List[torch.Tensor]], torch.Tensor]:
         bsz, seq_len = input_ids.shape
         if cache_position is not None:
             past_len = cache_position[0].item()
@@ -315,15 +380,18 @@ class CPULiteModel(CPULitePreTrainedModel):
         next_cache: List[PastKeyValue] = []
         all_hidden_states = [] if return_hidden_states else None
         actual_exit_layer = len(self.layers)
+        total_moe_loss = torch.zeros((), device=hidden_states.device)
 
         for idx, layer in enumerate(self.layers):
             if return_hidden_states:
                 all_hidden_states.append(hidden_states)
 
             past = None if past_key_values is None else past_key_values[idx]
-            hidden_states, present = layer(
+            hidden_states, present, moe_loss = layer(
                 hidden_states, attn_mask, position_ids, past, use_cache, cache_position
             )
+            total_moe_loss = total_moe_loss + moe_loss
+            
             if use_cache and present is not None:
                 next_cache.append(present)
 
@@ -335,7 +403,7 @@ class CPULiteModel(CPULitePreTrainedModel):
         if return_hidden_states:
             all_hidden_states.append(final_hidden)
 
-        return final_hidden, next_cache if use_cache else None, actual_exit_layer, all_hidden_states
+        return final_hidden, next_cache if use_cache else None, actual_exit_layer, all_hidden_states, total_moe_loss
 
 
 class CPULiteForCausalLM(CPULitePreTrainedModel):
@@ -355,12 +423,7 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
         )
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
-            if self.router_head is not None:
-                self._init_weights(self.router_head)
-            if self.verifier_head is not None:
-                self._init_weights(self.verifier_head)
-        else:
-            self.apply(self._init_weights)
+        self.apply(self._init_weights)
 
     @property
     def dtype(self) -> torch.dtype:
@@ -414,7 +477,7 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
         multi_exit_loss: bool = False,
         logits_to_keep: int = 0,
     ) -> CPULiteCausalLMOutput:
-        hidden, cache, _, all_hidden = self.model(
+        hidden, cache, _, all_hidden, moe_loss = self.model(
             input_ids,
             attention_mask,
             position_ids,
@@ -438,10 +501,13 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
+            
+            # Add MoE auxiliary loss
+            if moe_loss > 0:
+                loss = loss + self.config.moe_loss_weight * moe_loss
 
             # Multi-Exit Loss: Encourage intermediate layers to be useful
             if multi_exit_loss and all_hidden is not None:
-                # We skip the embedding layer (index 0) and the final layer (already computed)
                 num_inter_layers = len(all_hidden) - 2
                 if num_inter_layers > 0:
                     inter_loss_weight = 0.3 / num_inter_layers
@@ -455,17 +521,16 @@ class CPULiteForCausalLM(CPULitePreTrainedModel):
                             ignore_index=-100,
                         )
                         loss = loss + inter_loss_weight * inter_loss
-                        # Force cleanup of intermediate tensors if possible
                         del inter_hidden, inter_logits, shift_inter_logits
 
-        return CPULiteCausalLMOutput(loss=loss, logits=logits, past_key_values=cache)
+        return CPULiteCausalLMOutput(loss=loss, logits=logits, past_key_values=cache, moe_loss=moe_loss)
 
     def carp_heads(
         self,
         input_ids: torch.LongTensor,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> CPULiteCARPHeadOutput:
-        hidden, _, _, _ = self.model(
+        hidden, _, _, _, _ = self.model(
             input_ids,
             attention_mask=attention_mask,
             use_cache=False,

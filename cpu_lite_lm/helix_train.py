@@ -178,12 +178,25 @@ def helix_head_loss(
     heads = model.carp_heads(batch["input_ids"], attention_mask=batch["attention_mask"])
     if heads.router_logits is None or heads.verifier_logits is None:
         raise RuntimeError("Helix router/verifier heads are required")
-    router_loss = F.cross_entropy(heads.router_logits, batch["router_labels"], reduction="none")
-    verifier_loss = F.cross_entropy(heads.verifier_logits, batch["verifier_labels"], reduction="none")
+    
+    # Use label smoothing to stabilize loss when accuracy is high
+    router_loss = F.cross_entropy(
+        heads.router_logits, batch["router_labels"], reduction="none", label_smoothing=0.05
+    )
+    verifier_loss = F.cross_entropy(
+        heads.verifier_logits, batch["verifier_labels"], reduction="none", label_smoothing=0.05
+    )
+    
+    # If a batch has no diverse verifier labels (e.g. all 1s), the loss might collapse.
+    # We can detect this and scale down verifier loss if it's not providing useful signal.
+    if batch["verifier_labels"].float().std() < 1e-4:
+        verifier_loss_weight = verifier_loss_weight * 0.1
+
     weights = batch["weights"].to(router_loss.dtype)
     loss = (
         (router_loss_weight * router_loss + verifier_loss_weight * verifier_loss) * weights
     ).sum() / weights.sum().clamp_min(1.0)
+    
     router_acc = (torch.argmax(heads.router_logits, dim=-1) == batch["router_labels"]).float().mean()
     verifier_acc = (torch.argmax(heads.verifier_logits, dim=-1) == batch["verifier_labels"]).float().mean()
     return {
