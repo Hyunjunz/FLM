@@ -20,6 +20,8 @@ def main():
     p.add_argument("--max-new-tokens", type=int, default=32)
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--top-k", type=int, default=20)
+    p.add_argument("--helix", action="store_true", help="Use HelixMind CPU reasoning runtime")
+    p.add_argument("--helix-trained-router", action="store_true", help="Use trained Helix router head")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -38,32 +40,43 @@ def main():
     print("bos", getattr(model.config, "bos_token_id", None))
 
     ids = torch.tensor([input_ids], dtype=torch.long, device=device)
-
     chunks = []
+
     with torch.no_grad():
-        for i, tok in enumerate(
-            model.generate_streaming(
-                ids,
+        if args.helix:
+            from cpu_lite_lm.helix_runtime import HelixMindRuntime, HelixRuntimeState
+
+            runtime = HelixMindRuntime(
+                model,
+                tokenizer,
+                HelixRuntimeState(default_top_k=args.top_k, use_trained_router=args.helix_trained_router),
+            )
+            text = runtime.infer(
+                prompt,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_k=args.top_k,
-                use_cache=True,
-                eos_token_id=None,  # 일단 자동 eos 중단 막지 말고 None
+                eos_token_id=None,
             )
-        ):
-            print("STEP", i, "shape", tuple(tok.shape), "tok", tok.detach().cpu().tolist())
-
-            # generate_streaming이 [1,1]이든 [1,total]이든 마지막 토큰만 사용
-            if tok.ndim == 2:
-                tid = int(tok[0, -1].item())
-            else:
-                tid = int(tok[-1].item())
-
-            chunks.append(tid)
-
-            print("  token id:", tid)
-            print("  raw token:", repr(tokenizer.decode([tid], skip_special_tokens=False)))
-            print("  clean token:", repr(tokenizer.decode([tid], skip_special_tokens=True)))
+            chunks = tokenizer.encode(text).ids
+            print(text)
+        else:
+            for i, tok in enumerate(
+                model.generate_streaming(
+                    ids,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    top_k=args.top_k,
+                    use_cache=True,
+                    eos_token_id=None,
+                )
+            ):
+                print("STEP", i, "shape", tuple(tok.shape), "tok", tok.detach().cpu().tolist())
+                tid = int(tok[0, -1].item()) if tok.ndim == 2 else int(tok[-1].item())
+                chunks.append(tid)
+                print("  token id:", tid)
+                print("  raw token:", repr(tokenizer.decode([tid], skip_special_tokens=False)))
+                print("  clean token:", repr(tokenizer.decode([tid], skip_special_tokens=True)))
 
     print("\nCHUNKS:", chunks)
     print("RAW DECODE:")

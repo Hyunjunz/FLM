@@ -59,7 +59,23 @@ def generate(args: argparse.Namespace) -> str:
     with torch.inference_mode(), torch.autocast(
         device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None
     ):
-        if args.speculative:
+        if args.helix:
+            from .helix_runtime import HelixMindRuntime, HelixRuntimeState
+
+            runtime = HelixMindRuntime(
+                model,
+                tokenizer,
+                HelixRuntimeState(default_top_k=args.top_k, use_trained_router=args.helix_trained_router),
+            )
+            generated_text = runtime.infer(
+                full_prompt,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                eos_token_id=eos_id,
+            )
+            print(generated_text, end="", flush=True)
+        elif args.speculative:
             from .speculative import SelfSpeculativeGenerator
             generator = SelfSpeculativeGenerator(model, draft_layer=args.draft_layer, lookahead=args.lookahead)
             # Speculative yields slices or single tokens
@@ -108,6 +124,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--speculative", action="store_true", help="Use self-speculative decoding")
     parser.add_argument("--draft-layer", type=int, default=1, help="Layer to exit for draft prediction")
     parser.add_argument("--lookahead", type=int, default=3, help="Number of tokens to speculate")
+    parser.add_argument("--helix", action="store_true", help="Use HelixMind CPU reasoning runtime")
+    parser.add_argument("--helix-trained-router", action="store_true", help="Use trained Helix router head")
     return parser
 
 
