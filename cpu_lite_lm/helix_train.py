@@ -15,10 +15,10 @@ from torch.utils.data import DataLoader, Dataset
 
 from .configuration_cpu_lite import CPULiteConfig
 from .generate import load_model
-from .helix_data import prepare_helix_dataset
+from .helix_data import convert_jsonl_to_helix, normalize_helix_row, prepare_helix_dataset
 from .helix_runtime import HelixDifficultyRouter
 from .modeling_cpu_lite import CPULiteForCausalLM
-from .tokenizer_train import load_tokenizer
+from .tokenizer_train import load_tokenizer, train_tokenizer
 from .train import autocast_dtype, resolve_device
 
 
@@ -42,15 +42,26 @@ class HelixJsonlDataset(Dataset):
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.router = HelixDifficultyRouter()
-        self.rows = [self._parse(line) for line in self.path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        self.rows = []
+        skipped = 0
+        for line_no, line in enumerate(self.path.read_text(encoding="utf-8").splitlines(), start=1):
+            if not line.strip():
+                continue
+            row = self._parse(line)
+            if row is None:
+                skipped += 1
+                continue
+            self.rows.append(row)
+        if skipped:
+            print(f"Skipped {skipped} Helix rows without prompt text", flush=True)
         if not self.rows:
             raise ValueError(f"no rows found in {self.path}")
 
-    def _parse(self, line: str) -> Dict[str, Any]:
-        item = json.loads(line)
-        prompt = item.get("prompt") or item.get("question") or item.get("user") or item.get("input")
-        if not prompt:
-            raise ValueError("each row needs prompt/question/user/input")
+    def _parse(self, line: str) -> Dict[str, Any] | None:
+        item = normalize_helix_row(json.loads(line))
+        if item is None:
+            return None
+        prompt = item["prompt"]
         ids = self.tokenizer.encode(str(prompt)).ids[: self.block_size]
         if not ids:
             ids = [1]
@@ -79,6 +90,26 @@ class HelixJsonlDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         return self.rows[idx]
+
+
+def materialize_tokenizer_corpus(data_path: str | Path, output_path: str | Path) -> Path:
+    data_path = Path(data_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    written = 0
+    with data_path.open("r", encoding="utf-8") as src, output_path.open("w", encoding="utf-8") as dst:
+        for line in src:
+            if not line.strip():
+                continue
+            item = normalize_helix_row(json.loads(line))
+            text = None if item is None else item.get("prompt")
+            if isinstance(text, str) and text.strip():
+                dst.write(text.strip().replace("\r\n", "\n") + "\n")
+                written += 1
+    if written == 0:
+        raise ValueError(f"no tokenizer corpus text found in {data_path}")
+    print(f"Wrote tokenizer corpus with {written} docs to {output_path}", flush=True)
+    return output_path
 
 
 def collate_helix(batch: List[Dict[str, Any]], pad_token_id: int) -> Dict[str, torch.Tensor]:
@@ -158,6 +189,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data", default="data/helix_train.jsonl")
     parser.add_argument("--auto-download", action="store_true", help="Download/prepare Helix data when --data is missing")
+    parser.add_argument("--convert-data", action="store_true", help="Convert arbitrary JSONL data to Helix format before training")
+    parser.add_argument("--converted-data", default="", help="Converted Helix JSONL path; default is <data>.helix.jsonl")
+    parser.add_argument("--auto-tokenizer", action="store_true", help="Train a tokenizer when --tokenizer is missing")
+    parser.add_argument("--tokenizer-vocab-size", type=int, default=32000)
+    parser.add_argument("--tokenizer-max-docs", type=int, default=50000)
     parser.add_argument(
         "--download-preset",
         choices=["reasoning_mix", "small_reasoning", "synthetic"],
@@ -192,7 +228,6 @@ def main() -> None:
         torch.set_num_threads(args.cpu_threads)
         torch.set_num_interop_threads(max(1, min(2, args.cpu_threads)))
 
-    tokenizer_path = args.tokenizer or str(Path(args.model) / "tokenizer.json")
     data_path = Path(args.data)
     if args.auto_download and not data_path.exists():
         prepare_helix_dataset(
@@ -207,6 +242,28 @@ def main() -> None:
         raise FileNotFoundError(
             f"Helix training data not found: {data_path}. "
             "Pass --auto-download to download/prepare it automatically."
+        )
+    if args.convert_data:
+        converted_path = Path(args.converted_data) if args.converted_data else data_path.with_suffix(".helix.jsonl")
+        convert_jsonl_to_helix(data_path, converted_path)
+        data_path = converted_path
+    tokenizer_path = Path(args.tokenizer or str(Path(args.model) / "tokenizer.json"))
+    if not tokenizer_path.exists() and (args.auto_tokenizer or args.auto_download):
+        tokenizer_output_dir = tokenizer_path if tokenizer_path.suffix == "" else tokenizer_path.parent
+        tokenizer_output_dir.mkdir(parents=True, exist_ok=True)
+        corpus_path = tokenizer_output_dir / "helix_tokenizer_corpus.txt"
+        materialize_tokenizer_corpus(data_path, corpus_path)
+        train_tokenizer(
+            corpus_path,
+            tokenizer_output_dir,
+            vocab_size=args.tokenizer_vocab_size,
+            text_column="text",
+            max_docs=args.tokenizer_max_docs,
+        )
+    if not tokenizer_path.exists():
+        raise FileNotFoundError(
+            f"Tokenizer file not found: {tokenizer_path}. "
+            "Pass --auto-tokenizer, or omit --tokenizer when the model directory has tokenizer.json."
         )
     tokenizer = load_tokenizer(tokenizer_path)
     device = resolve_device(args.device)

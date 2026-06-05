@@ -11,6 +11,74 @@ from typing import Any, Callable, Dict, Iterable, List, Tuple
 HelixRow = Dict[str, Any]
 
 
+def normalize_helix_row(item: Dict[str, Any]) -> HelixRow | None:
+    prompt = _extract_prompt(item)
+    if not prompt:
+        return None
+    difficulty = item.get("difficulty", item.get("router_label"))
+    if isinstance(difficulty, int):
+        difficulty = ("easy", "medium", "hard")[max(0, min(2, difficulty))]
+    elif isinstance(difficulty, str):
+        lowered = difficulty.lower()
+        if lowered in {"0", "easy"}:
+            difficulty = "easy"
+        elif lowered in {"1", "medium"}:
+            difficulty = "medium"
+        elif lowered in {"2", "hard", "critical"}:
+            difficulty = "hard"
+        else:
+            difficulty = None
+
+    verifier = item.get("verifier_label")
+    if verifier is None:
+        verifier = item.get("accepted", item.get("correct", item.get("is_correct", None)))
+    accepted = True if verifier is None else bool(verifier)
+
+    row: HelixRow = {
+        "prompt": prompt,
+        "accepted": accepted,
+        "source": item.get("source", "converted"),
+    }
+    if difficulty is not None:
+        row["difficulty"] = difficulty
+    if "weight" in item:
+        row["weight"] = float(item["weight"])
+    return row
+
+
+def _extract_prompt(item: Dict[str, Any]) -> str:
+    for key in ("prompt", "question", "user", "input", "instruction"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            if key == "instruction" and isinstance(item.get("output"), str):
+                return f"Instruction:\n{value.strip()}\n\nExpected answer:\n{item['output'].strip()}"
+            return value.strip()
+
+    text = item.get("text")
+    if isinstance(text, str) and text.strip():
+        return text.strip()
+
+    messages = item.get("messages")
+    if isinstance(messages, list):
+        parts = []
+        for message in messages:
+            if isinstance(message, dict):
+                role = str(message.get("role", "user"))
+                content = message.get("content")
+                if isinstance(content, str) and content.strip():
+                    parts.append(f"{role}: {content.strip()}")
+        if parts:
+            return "\n".join(parts)
+
+    if isinstance(item.get("answer"), str):
+        answer = item["answer"].strip()
+        for key in ("context", "passage"):
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return f"{value.strip()}\n\nAnswer: {answer}"
+    return ""
+
+
 def write_jsonl(rows: Iterable[HelixRow], output: str | Path) -> Path:
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -23,6 +91,25 @@ def write_jsonl(rows: Iterable[HelixRow], output: str | Path) -> Path:
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
             count += 1
     print(f"Wrote {count} Helix rows to {output}", flush=True)
+    return output
+
+
+def convert_jsonl_to_helix(input_path: str | Path, output_path: str | Path) -> Path:
+    input_path = Path(input_path)
+    converted: List[HelixRow] = []
+    skipped = 0
+    with input_path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            row = normalize_helix_row(json.loads(line))
+            if row is None:
+                skipped += 1
+                continue
+            converted.append(row)
+    output = write_jsonl(converted, output_path)
+    if skipped:
+        print(f"Skipped {skipped} rows without usable text fields", flush=True)
     return output
 
 

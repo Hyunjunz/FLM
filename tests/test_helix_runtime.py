@@ -1,8 +1,14 @@
 import torch
 
 from cpu_lite_lm import CPULiteConfig, CPULiteForCausalLM, HelixMindRuntime, HelixRuntimeState
-from cpu_lite_lm.helix_data import build_synthetic_helix_rows, prepare_helix_dataset
-from cpu_lite_lm.helix_train import collate_helix, ensure_helix_heads, freeze_base_train_heads, helix_head_loss
+from cpu_lite_lm.helix_data import build_synthetic_helix_rows, convert_jsonl_to_helix, prepare_helix_dataset
+from cpu_lite_lm.helix_train import (
+    collate_helix,
+    ensure_helix_heads,
+    freeze_base_train_heads,
+    helix_head_loss,
+    materialize_tokenizer_corpus,
+)
 
 
 class TinyTokenizer:
@@ -86,3 +92,30 @@ def test_prepare_synthetic_helix_dataset(tmp_path):
     assert len(rows) >= 8
     built = build_synthetic_helix_rows(8)
     assert any(row["accepted"] is False for row in built)
+
+
+def test_materialize_tokenizer_corpus_from_helix_jsonl(tmp_path):
+    data = tmp_path / "helix.jsonl"
+    data.write_text('{"prompt":"hello tokenizer","difficulty":"easy","accepted":true}\n', encoding="utf-8")
+    corpus = materialize_tokenizer_corpus(data, tmp_path / "corpus.txt")
+    assert corpus.read_text(encoding="utf-8").strip() == "hello tokenizer"
+
+
+def test_convert_mixed_jsonl_to_helix(tmp_path):
+    src = tmp_path / "mixed.jsonl"
+    src.write_text(
+        "\n".join(
+            [
+                '{"text":"raw sft text","router_label":1}',
+                '{"instruction":"solve this","output":"answer","difficulty":"hard"}',
+                '{"question":"what is this?","answer":"that","accepted":true}',
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "helix.jsonl"
+    convert_jsonl_to_helix(src, out)
+    rows = out.read_text(encoding="utf-8").splitlines()
+    assert len(rows) == 3
+    assert "prompt" in rows[0]
