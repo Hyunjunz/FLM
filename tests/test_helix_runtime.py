@@ -68,7 +68,7 @@ def test_helix_head_training_loss_backprops_only_heads():
     )
     model = CPULiteForCausalLM(cfg)
     ensure_helix_heads(model)
-    freeze_base_train_heads(model)
+    freeze_base_train_heads(model, train_last_n_layers=0, train_norm=False)
     batch = collate_helix(
         [
             {"input_ids": [1, 2, 3], "router_label": 0, "verifier_label": 1, "weight": 1.0},

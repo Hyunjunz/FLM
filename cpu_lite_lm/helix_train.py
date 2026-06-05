@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import signal
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -147,23 +148,42 @@ def ensure_helix_heads(model: CPULiteForCausalLM) -> None:
         model.verifier_head = nn.Linear(hidden, 2)
 
 
-def freeze_base_train_heads(model: CPULiteForCausalLM) -> None:
+def freeze_base_train_heads(
+    model: CPULiteForCausalLM,
+    train_last_n_layers: int = 0,
+    train_norm: bool = False,
+) -> None:
     for parameter in model.parameters():
         parameter.requires_grad = False
     for head in (model.router_head, model.verifier_head):
         if head is not None:
             for parameter in head.parameters():
                 parameter.requires_grad = True
+    if train_last_n_layers > 0:
+        layers = list(model.model.layers)
+        for layer in layers[-train_last_n_layers:]:
+            for parameter in layer.parameters():
+                parameter.requires_grad = True
+    if train_norm:
+        for parameter in model.model.norm.parameters():
+            parameter.requires_grad = True
 
 
-def helix_head_loss(model: CPULiteForCausalLM, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+def helix_head_loss(
+    model: CPULiteForCausalLM,
+    batch: Dict[str, torch.Tensor],
+    router_loss_weight: float = 1.0,
+    verifier_loss_weight: float = 1.0,
+) -> Dict[str, torch.Tensor]:
     heads = model.carp_heads(batch["input_ids"], attention_mask=batch["attention_mask"])
     if heads.router_logits is None or heads.verifier_logits is None:
         raise RuntimeError("Helix router/verifier heads are required")
     router_loss = F.cross_entropy(heads.router_logits, batch["router_labels"], reduction="none")
     verifier_loss = F.cross_entropy(heads.verifier_logits, batch["verifier_labels"], reduction="none")
     weights = batch["weights"].to(router_loss.dtype)
-    loss = ((router_loss + verifier_loss) * weights).sum() / weights.sum().clamp_min(1.0)
+    loss = (
+        (router_loss_weight * router_loss + verifier_loss_weight * verifier_loss) * weights
+    ).sum() / weights.sum().clamp_min(1.0)
     router_acc = (torch.argmax(heads.router_logits, dim=-1) == batch["router_labels"]).float().mean()
     verifier_acc = (torch.argmax(heads.verifier_logits, dim=-1) == batch["verifier_labels"]).float().mean()
     return {
@@ -217,12 +237,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--learning-rate", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--router-loss-weight", type=float, default=0.5)
+    parser.add_argument("--verifier-loss-weight", type=float, default=1.5)
+    parser.add_argument("--train-last-n-layers", type=int, default=0)
+    parser.add_argument("--train-norm", action="store_true")
     parser.add_argument("--warmup-steps", type=int, default=10)
     parser.add_argument("--min-lr-ratio", type=float, default=0.1)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp-dtype", choices=["off", "fp16", "bf16"], default="off")
     parser.add_argument("--cpu-threads", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=20)
+    parser.add_argument("--save-every", type=int, default=500)
     parser.add_argument("--seed", type=int, default=1234)
     return parser
 
@@ -279,7 +304,11 @@ def main() -> None:
     model = load_model(args.model, args.config)
     ensure_helix_heads(model)
     model.resize_token_embeddings(tokenizer.get_vocab_size())
-    freeze_base_train_heads(model)
+    freeze_base_train_heads(
+        model,
+        train_last_n_layers=args.train_last_n_layers,
+        train_norm=args.train_norm,
+    )
     model.to(device).train()
 
     dataset = HelixJsonlDataset(data_path, tokenizer, block_size=args.block_size)
@@ -312,31 +341,52 @@ def main() -> None:
     print(f"Helix trainable params: {trainable:,}", flush=True)
 
     step = 0
-    while step < args.max_steps:
-        for batch in loader:
-            batch = {key: value.to(device) for key, value in batch.items()}
-            optimizer.zero_grad(set_to_none=True)
-            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
-                out = helix_head_loss(model, batch)
-            out["loss"].backward()
-            torch.nn.utils.clip_grad_norm_(
-                [parameter for parameter in model.parameters() if parameter.requires_grad], 1.0
-            )
-            optimizer.step()
-            scheduler.step()
-            step += 1
-            if step == 1 or step % args.log_every == 0:
-                print(
-                    f"step {step}/{args.max_steps} loss {float(out['loss'].detach()):.4f} "
-                    f"router {float(out['router_loss']):.4f} verifier {float(out['verifier_loss']):.4f} "
-                    f"router_acc {float(out['router_acc']):.3f} verifier_acc {float(out['verifier_acc']):.3f} "
-                    f"lr {scheduler.get_last_lr()[0]:.3e}",
-                    flush=True,
-                )
-            if step >= args.max_steps:
-                break
+    interrupted = False
 
-    save_checkpoint(model, tokenizer, args, Path(args.output_dir), step)
+    def _handle_stop(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+        print(f"Received signal {signum}; saving checkpoint after current batch...", flush=True)
+
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    previous_sigterm = signal.getsignal(signal.SIGTERM)
+    signal.signal(signal.SIGINT, _handle_stop)
+    signal.signal(signal.SIGTERM, _handle_stop)
+    try:
+        while step < args.max_steps and not interrupted:
+            for batch in loader:
+                batch = {key: value.to(device) for key, value in batch.items()}
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
+                    out = helix_head_loss(
+                        model,
+                        batch,
+                        router_loss_weight=args.router_loss_weight,
+                        verifier_loss_weight=args.verifier_loss_weight,
+                    )
+                out["loss"].backward()
+                torch.nn.utils.clip_grad_norm_(
+                    [parameter for parameter in model.parameters() if parameter.requires_grad], 1.0
+                )
+                optimizer.step()
+                scheduler.step()
+                step += 1
+                if step == 1 or step % args.log_every == 0:
+                    print(
+                        f"step {step}/{args.max_steps} loss {float(out['loss'].detach()):.4f} "
+                        f"router {float(out['router_loss']):.4f} verifier {float(out['verifier_loss']):.4f} "
+                        f"router_acc {float(out['router_acc']):.3f} verifier_acc {float(out['verifier_acc']):.3f} "
+                        f"lr {scheduler.get_last_lr()[0]:.3e}",
+                        flush=True,
+                    )
+                if args.save_every > 0 and step % args.save_every == 0:
+                    save_checkpoint(model, tokenizer, args, Path(args.output_dir), step)
+                if step >= args.max_steps or interrupted:
+                    break
+    finally:
+        signal.signal(signal.SIGINT, previous_sigint)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        save_checkpoint(model, tokenizer, args, Path(args.output_dir), step)
 
 
 def save_checkpoint(model, tokenizer, args: argparse.Namespace, output: Path, step: int) -> None:
