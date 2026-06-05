@@ -232,11 +232,21 @@ def build_synthetic_helix_rows(examples: int = 2000, seed: int = 1234) -> List[H
     return rows
 
 
+HF_DATASET_ALIASES = {
+    "gsm8k": "openai/gsm8k",
+    "piqa": "ybisk/piqa",
+    "winogrande": "allenai/winogrande",
+    "race": "ehovy/race",
+    "sciq": "allenai/sciq",
+}
+
+
 def _load_hf_dataset(name: str, config: str | None, split: str, cache_dir: str | None):
     try:
         from datasets import load_dataset
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("Auto download requires `pip install datasets`.") from exc
+    name = HF_DATASET_ALIASES.get(name, name)
     if config:
         return load_dataset(name, config, split=split, cache_dir=cache_dir)
     return load_dataset(name, split=split, cache_dir=cache_dir)
@@ -485,12 +495,19 @@ def build_hf_helix_rows(
     preset: str = "reasoning_mix",
     max_examples_per_dataset: int = 2000,
     cache_dir: str | None = None,
+    skip_errors: bool = True,
 ) -> List[HelixRow]:
     if preset not in HF_PRESETS:
         raise ValueError(f"unknown Helix dataset preset: {preset}")
     rows: List[HelixRow] = []
     for name, config, split, formatter in HF_PRESETS[preset]:
-        ds = _load_hf_dataset(name, config, split, cache_dir)
+        try:
+            ds = _load_hf_dataset(name, config, split, cache_dir)
+        except Exception as exc:
+            if not skip_errors:
+                raise
+            print(f"Skipped HF dataset {name}/{config or 'default'}/{split}: {exc}", flush=True)
+            continue
         limit = len(ds) if max_examples_per_dataset <= 0 else min(max_examples_per_dataset, len(ds))
         before = len(rows)
         for idx in range(limit):
@@ -508,11 +525,12 @@ def prepare_helix_dataset(
     seed: int = 1234,
     balance: bool = True,
     max_per_difficulty: int = 12000,
+    skip_errors: bool = True,
 ) -> Path:
     if preset == "synthetic":
         rows = build_synthetic_helix_rows(max_examples_per_dataset, seed)
     else:
-        rows = build_hf_helix_rows(preset, max_examples_per_dataset, cache_dir)
+        rows = build_hf_helix_rows(preset, max_examples_per_dataset, cache_dir, skip_errors=skip_errors)
         if synthetic_examples > 0:
             rows.extend(build_synthetic_helix_rows(synthetic_examples, seed))
     print_helix_summary(rows, "Helix data before balance")

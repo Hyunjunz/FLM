@@ -204,6 +204,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--download-cache-dir", default="data/hf_cache")
     parser.add_argument("--synthetic-examples", type=int, default=1000)
     parser.add_argument("--no-balance-data", action="store_true")
+    parser.add_argument("--no-skip-download-errors", action="store_true")
     parser.add_argument("--max-per-difficulty", type=int, default=12000)
     parser.add_argument("--model", default="artifacts/micro_ckpt")
     parser.add_argument("--config", default="configs/micro.json")
@@ -242,6 +243,7 @@ def main() -> None:
             seed=args.seed,
             balance=not args.no_balance_data,
             max_per_difficulty=args.max_per_difficulty,
+            skip_errors=not args.no_skip_download_errors,
         )
     if not data_path.exists():
         raise FileNotFoundError(

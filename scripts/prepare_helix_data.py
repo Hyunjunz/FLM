@@ -20,6 +20,7 @@ def main() -> None:
     parser.add_argument("--cache-dir", default="data/hf_cache")
     parser.add_argument("--synthetic-examples", type=int, default=1000)
     parser.add_argument("--no-balance-data", action="store_true")
+    parser.add_argument("--no-skip-download-errors", action="store_true")
     parser.add_argument("--max-per-difficulty", type=int, default=12000)
     parser.add_argument("--seed", type=int, default=1234)
     args = parser.parse_args()
@@ -32,6 +33,7 @@ def main() -> None:
         seed=args.seed,
         balance=not args.no_balance_data,
         max_per_difficulty=args.max_per_difficulty,
+        skip_errors=not args.no_skip_download_errors,
     )
 
 
