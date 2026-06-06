@@ -46,6 +46,7 @@ def iter_texts_from_path(
         else:
             text = path.read_text(encoding="utf-8")
             if text.strip() and should_yield(text):
+                yielded += 1
                 yield text
         return
 
@@ -141,7 +142,8 @@ class TextCausalLMDataset(Dataset):
         min_chars: int = 0,
         skip_docs: int = 0,
         quality_filter: bool = False,
-        max_chars: int = 200_000,
+        max_chars: int = 0,
+        stride: Optional[int] = None,
     ) -> None:
         ids = []
         used_chars = 0
@@ -171,7 +173,7 @@ class TextCausalLMDataset(Dataset):
         self.block_size = block_size
         self.ids = ids
         self.examples = []
-        step = max(1, block_size)
+        step = max(1, stride if stride is not None else block_size)
         for start in range(0, max(1, len(ids) - 1), step):
             chunk = ids[start : start + block_size]
             if len(chunk) >= 2:
@@ -221,6 +223,7 @@ class StreamingTextCausalLMDataset(IterableDataset):
         max_chars: int = 0,
         shuffle_buffer: int = 0,
         seed: int = 1234,
+        stride: Optional[int] = None,
     ) -> None:
         self.data_path = data_path
         self.tokenizer = tokenizer
@@ -234,6 +237,9 @@ class StreamingTextCausalLMDataset(IterableDataset):
         self.shuffle_buffer = shuffle_buffer
         self.seed = seed
         self.eos_id = tokenizer.token_to_id("<eos>")
+        self.stride = stride if stride is not None else block_size
+        if self.stride != block_size:
+            raise ValueError("StreamingTextCausalLMDataset currently requires stride == block_size")
 
     def __iter__(self):
         buffer = []

@@ -9,7 +9,7 @@ import time
 import psutil
 import torch
 
-from .generate import load_model
+from .generate import load_model, maybe_dynamic_int8
 from .modeling_cpu_lite import CPULiteForCausalLM
 
 
@@ -22,6 +22,7 @@ def benchmark(args: argparse.Namespace) -> None:
         torch.set_num_threads(args.threads)
         torch.set_num_interop_threads(max(1, min(2, args.threads)))
     model = load_model(args.model, args.config).eval()
+    model = maybe_dynamic_int8(model, args.dynamic_int8, torch.device("cpu")).eval()
     if args.disable_moe_for_small_model and model.config.hidden_size <= args.small_model_hidden_threshold:
         model.config.num_experts = 0
         model.config.num_experts_per_tok = 0
@@ -72,6 +73,7 @@ def benchmark(args: argparse.Namespace) -> None:
     print(f"Decode tok/s: {decode:.2f}")
     print(f"RSS memory MB: {rss_mb():.2f}")
     print(f"Use cache: {str(args.use_cache).lower()}")
+    print(f"Dynamic int8: {str(args.dynamic_int8).lower()}")
     print(f"MoE experts: {getattr(model.config, 'num_experts', 0)}")
     print(f"MoE top-k: {getattr(model.config, 'num_experts_per_tok', 0)}")
 
@@ -80,6 +82,7 @@ def benchmark(args: argparse.Namespace) -> None:
         dense_cfg.num_experts = 0
         dense_cfg.num_experts_per_tok = 0
         dense_model = CPULiteForCausalLM(dense_cfg).eval()
+        dense_model = maybe_dynamic_int8(dense_model, args.dynamic_int8, torch.device("cpu")).eval()
         dense_decode = _decode_tokens_per_sec(dense_model, args)
         print(f"Dense random-init decode tok/s: {dense_decode:.2f}")
 
@@ -98,6 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--disable-moe-for-small-model", action="store_true")
     parser.add_argument("--small-model-hidden-threshold", type=int, default=512)
     parser.add_argument("--compare-dense-moe", action="store_true")
+    parser.add_argument("--dynamic-int8", action="store_true")
     return parser
 
 

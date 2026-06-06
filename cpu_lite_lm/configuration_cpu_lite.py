@@ -113,6 +113,16 @@ class CPULiteConfig(PretrainedConfig):
             )
         if self.num_key_value_heads <= 0:
             raise ValueError("num_key_value_heads must be positive")
+        if self.num_experts < 0:
+            raise ValueError("num_experts must be non-negative")
+        if self.num_experts == 0:
+            if self.num_experts_per_tok != 0:
+                raise ValueError("num_experts_per_tok must be 0 when num_experts is 0")
+        else:
+            if self.num_experts_per_tok <= 0:
+                raise ValueError("num_experts_per_tok must be positive when num_experts is enabled")
+            if self.num_experts_per_tok > self.num_experts:
+                raise ValueError("num_experts_per_tok cannot exceed num_experts")
 
     @classmethod
     def from_json_file(cls, path: str | Path) -> "CPULiteConfig":

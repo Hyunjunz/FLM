@@ -49,6 +49,13 @@ def autocast_dtype(name: str) -> Optional[torch.dtype]:
     raise ValueError(f"Unsupported --amp-dtype {name}. Use off, fp16, or bf16.")
 
 
+def count_causal_loss_tokens(batch: dict[str, torch.Tensor]) -> int:
+    labels = batch["labels"]
+    if labels.size(1) <= 1:
+        return 0
+    return int((labels[:, 1:] != -100).sum().item())
+
+
 @torch.no_grad()
 def evaluate_loss(
     model: torch.nn.Module,
@@ -66,7 +73,7 @@ def evaluate_loss(
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None):
             out = model(**batch)
-        tokens = int(batch["attention_mask"].sum().item())
+        tokens = count_causal_loss_tokens(batch)
         total_loss += float(out.loss.item()) * tokens
         total_tokens += tokens
         batches += 1
@@ -150,6 +157,7 @@ def train(args: argparse.Namespace) -> Path:
         skip_docs=args.skip_docs,
         quality_filter=args.quality_filter,
         max_chars=args.max_chars,
+        stride=args.stride,
     )
     if args.streaming:
         dataset = StreamingTextCausalLMDataset(
@@ -162,6 +170,17 @@ def train(args: argparse.Namespace) -> Path:
         )
     else:
         dataset = TextCausalLMDataset(args.data, tokenizer, args.block_size, **dataset_kwargs)
+        token_count = len(dataset.ids)
+        print(
+            f"Loaded train tokens: {token_count} examples: {len(dataset)} stride: {args.stride or args.block_size}",
+            flush=True,
+        )
+        if token_count < 1_000_000 and args.max_steps > 100:
+            print(
+                "Warning: training corpus has fewer than 1,000,000 tokens; "
+                "rapid train loss collapse is likely overfitting, not model skill.",
+                flush=True,
+            )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -179,6 +198,12 @@ def train(args: argparse.Namespace) -> Path:
                 flush=True,
             )
             eval_data = args.data
+        if not args.eval_data:
+            print(
+                "Warning: --eval-every is enabled without --eval-data; validation loss will use "
+                "the training source and can be over-optimistic.",
+                flush=True,
+            )
         print(
             f"Building validation loader from {eval_data} "
             f"(docs={args.eval_docs}, max_chars={args.eval_max_chars})",
@@ -194,6 +219,7 @@ def train(args: argparse.Namespace) -> Path:
             skip_docs=args.eval_skip_docs,
             quality_filter=args.quality_filter,
             max_chars=args.eval_max_chars,
+            stride=args.stride,
         )
         eval_loader = DataLoader(
             eval_dataset,
@@ -246,7 +272,7 @@ def train(args: argparse.Namespace) -> Path:
             running_loss = 0.0
             if step % args.log_every == 0 or step == 1:
                 ppl = math.exp(min(mean_loss, 20.0))
-                tokens = int(batch["attention_mask"].sum().item())
+                tokens = count_causal_loss_tokens(batch)
                 eff_tokens = tokens * args.grad_accum_steps
                 print(
                     f"step {step}/{target} loss {mean_loss:.4f} ppl {ppl:.2f} tokens {eff_tokens}",
@@ -296,12 +322,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-steps", type=int, default=5)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--text-column", default="text")
-    parser.add_argument("--max-docs", type=parse_optional_int, default=2000)
+    parser.add_argument("--max-docs", type=parse_optional_int, default=None)
     parser.add_argument("--min-chars", type=int, default=0)
     parser.add_argument("--skip-docs", type=int, default=0)
     parser.add_argument("--quality-filter", action="store_true")
-    parser.add_argument("--max-chars", type=int, default=200_000)
-    parser.add_argument("--tokenizer-max-docs", type=parse_optional_int, default=2000)
+    parser.add_argument("--max-chars", type=int, default=0)
+    parser.add_argument("--stride", type=int, default=None, help="Training window stride; defaults to block-size")
+    parser.add_argument("--tokenizer-max-docs", type=parse_optional_int, default=None)
     parser.add_argument("--tokenizer-log-every", type=int, default=1000)
     parser.add_argument("--streaming", action="store_true")
     parser.add_argument("--shuffle-buffer", type=int, default=0)
@@ -325,7 +352,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--eval-data", default="")
     parser.add_argument("--eval-docs", type=int, default=256)
     parser.add_argument("--eval-skip-docs", type=int, default=0)
-    parser.add_argument("--eval-max-chars", type=int, default=200_000)
+    parser.add_argument("--eval-max-chars", type=int, default=0)
     parser.add_argument("--eval-max-batches", type=int, default=20)
     parser.add_argument("--multi-exit-loss", action="store_true", help="Enable loss for intermediate layers")
     return parser

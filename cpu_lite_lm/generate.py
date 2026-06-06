@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 
 from .configuration_cpu_lite import CPULiteConfig
 from .modeling_cpu_lite import CPULiteForCausalLM
@@ -35,6 +36,14 @@ def _amp_dtype(name: str):
     raise ValueError(f"Unsupported amp dtype: {name}")
 
 
+def maybe_dynamic_int8(model: CPULiteForCausalLM, enabled: bool, device: torch.device):
+    if not enabled:
+        return model
+    if device.type != "cpu":
+        raise ValueError("--dynamic-int8 is CPU-only")
+    return torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+
+
 def apply_preset(args: argparse.Namespace) -> None:
     if args.preset == "fast":
         args.helix = True
@@ -62,6 +71,7 @@ def generate(args: argparse.Namespace) -> str:
         torch.set_num_interop_threads(max(1, min(2, args.cpu_threads)))
     tokenizer = load_tokenizer(args.tokenizer)
     model = load_model(args.model, args.config).to(device).eval()
+    model = maybe_dynamic_int8(model, args.dynamic_int8, device).eval()
     
     # Format prompt based on system/user input
     full_prompt = args.prompt
@@ -151,6 +161,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp-dtype", choices=["off", "fp16", "bf16"], default="off")
     parser.add_argument("--cpu-threads", type=int, default=0)
+    parser.add_argument("--dynamic-int8", action="store_true", help="Apply CPU dynamic int8 quantization to Linear layers")
     parser.add_argument("--speculative", action="store_true", help="Use self-speculative decoding")
     parser.add_argument("--draft-layer", type=int, default=1, help="Layer to exit for draft prediction")
     parser.add_argument("--lookahead", type=int, default=3, help="Number of tokens to speculate")

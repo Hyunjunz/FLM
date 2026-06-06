@@ -54,7 +54,9 @@ class SelfSpeculativeGenerator:
             draft_ids = generated[:, -1:]
             draft_tokens = []
             
-            temp_pos = cur_pos
+            # Re-score the final committed token at its real position to draft
+            # the next token from the same context as full-depth decoding.
+            temp_pos = cur_pos - 1
             for _ in range(self.lookahead):
                 out = self.model(
                     draft_ids, 
@@ -128,9 +130,6 @@ class SelfSpeculativeGenerator:
             # Update position
             cur_pos = generated.size(1)
             # print(f"Accepted {accepted_count}, total size {cur_pos}")
-            
-            if eos is not None and (generated[:, -1] == eos).any():
-                break
             
             if eos is not None and (generated[:, -1] == eos).any():
                 break

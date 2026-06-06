@@ -53,7 +53,10 @@ def train_tokenizer(
     else:
         if (data_path / "dataset_info.json").exists() or (data_path / "state.json").exists():
             iterator = iter_texts_from_saved_dataset(data_path, text_column, max_docs, log_every)
-            tokenizer.train_from_iterator(iterator, trainer=trainer, length=max_docs)
+            if max_docs is None:
+                tokenizer.train_from_iterator(iterator, trainer=trainer)
+            else:
+                tokenizer.train_from_iterator(iterator, trainer=trainer, length=max_docs)
             path = output_dir / "tokenizer.json"
             tokenizer.save(str(path))
             print(f"Tokenizer vocab size: {tokenizer.get_vocab_size()}", flush=True)
@@ -69,7 +72,10 @@ def train_tokenizer(
                 yield text
 
         iterator = logging_iterator()
-        tokenizer.train_from_iterator(iterator, trainer=trainer, length=max_docs)
+        if max_docs is None:
+            tokenizer.train_from_iterator(iterator, trainer=trainer)
+        else:
+            tokenizer.train_from_iterator(iterator, trainer=trainer, length=max_docs)
     tokenizer.post_processor = TemplateProcessing(
         single="<bos> $A <eos>",
         pair="<bos> $A <eos> $B:1 <eos>:1",
