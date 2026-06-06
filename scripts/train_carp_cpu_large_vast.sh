@@ -42,6 +42,7 @@ VOCAB_SIZE="${VOCAB_SIZE:-32000}"
 REASONING_TOKENS="${REASONING_TOKENS:-128}"
 BLOCK_SIZE="${BLOCK_SIZE:-256}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
+GRAD_ACCUM_STEPS="${GRAD_ACCUM_STEPS:-1}"
 MAX_STEPS="${MAX_STEPS:-5000}"
 SAVE_EVERY="${SAVE_EVERY:-0}"
 SAVE_STEP_DIRS="${SAVE_STEP_DIRS:-0}"
@@ -51,6 +52,10 @@ RANKING_LOSS_WEIGHT="${RANKING_LOSS_WEIGHT:-0.5}"
 AMP_DTYPE="${AMP_DTYPE:-fp16}"
 DEVICE="${DEVICE:-cuda}"
 CPU_THREADS="${CPU_THREADS:-0}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
+COMPILE="${COMPILE:-1}"
+TF32="${TF32:-1}"
 EVAL_BATCH_SIZE="${EVAL_BATCH_SIZE:-64}"
 
 echo "CARP CPU-large Vast training"
@@ -59,8 +64,8 @@ echo "  config=$CONFIG"
 echo "  tokenizer=$TOKENIZER"
 echo "  base_model=${BASE_MODEL:-<none>}"
 echo "  output=$OUTPUT_DIR"
-echo "  block_size=$BLOCK_SIZE batch_size=$BATCH_SIZE max_steps=$MAX_STEPS"
-echo "  device=$DEVICE amp=$AMP_DTYPE"
+echo "  block_size=$BLOCK_SIZE batch_size=$BATCH_SIZE grad_accum_steps=$GRAD_ACCUM_STEPS max_steps=$MAX_STEPS"
+echo "  device=$DEVICE amp=$AMP_DTYPE compile=$COMPILE workers=$NUM_WORKERS"
 echo
 
 python -u scripts/download_carp_language.py \
@@ -87,6 +92,7 @@ args=(
   --reasoning-tokens "$REASONING_TOKENS"
   --block-size "$BLOCK_SIZE"
   --batch-size "$BATCH_SIZE"
+  --grad-accum-steps "$GRAD_ACCUM_STEPS"
   --max-steps "$MAX_STEPS"
   --learning-rate "$LEARNING_RATE"
   --router-loss-weight "$ROUTER_LOSS_WEIGHT"
@@ -95,6 +101,8 @@ args=(
   --device "$DEVICE"
   --amp-dtype "$AMP_DTYPE"
   --cpu-threads "$CPU_THREADS"
+  --num-workers "$NUM_WORKERS"
+  --prefetch-factor "$PREFETCH_FACTOR"
 )
 
 if [[ -n "$BASE_MODEL" ]]; then
@@ -103,6 +111,14 @@ fi
 
 if [[ "$SAVE_STEP_DIRS" == "1" ]]; then
   args+=(--save-step-dirs)
+fi
+
+if [[ "$TF32" == "1" ]]; then
+  args+=(--tf32)
+fi
+
+if [[ "$COMPILE" == "1" ]]; then
+  args+=(--compile)
 fi
 
 python -u scripts/train_carp_sft.py "${args[@]}"

@@ -8,7 +8,7 @@ import random
 from typing import Dict, Iterator, Optional
 
 import torch
-from torch.utils.data import Dataset, IterableDataset
+from torch.utils.data import Dataset, IterableDataset, get_worker_info
 
 
 def iter_texts_from_path(
@@ -242,23 +242,28 @@ class StreamingTextCausalLMDataset(IterableDataset):
             raise ValueError("StreamingTextCausalLMDataset currently requires stride == block_size")
 
     def __iter__(self):
+        worker = get_worker_info()
+        worker_id = worker.id if worker is not None else 0
+        num_workers = worker.num_workers if worker is not None else 1
         buffer = []
         chunk_buffer = []
-        rng = random.Random(self.seed)
+        rng = random.Random(self.seed + worker_id)
 
         def emit_chunk(chunk):
             x = torch.tensor(chunk, dtype=torch.long)
             return {"input_ids": x, "labels": x.clone()}
 
         used_chars = 0
-        for text in iter_texts_from_path(
+        for doc_idx, text in enumerate(iter_texts_from_path(
             self.data_path,
             text_column=self.text_column,
             max_docs=self.max_docs,
             min_chars=self.min_chars,
             skip_docs=self.skip_docs,
             quality_filter=self.quality_filter,
-        ):
+        )):
+            if num_workers > 1 and doc_idx % num_workers != worker_id:
+                continue
             if self.max_chars > 0:
                 remaining = self.max_chars - used_chars
                 if remaining <= 0:

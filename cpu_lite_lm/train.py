@@ -5,11 +5,12 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import time
 from pathlib import Path
 from typing import Optional
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 
 from .configuration_cpu_lite import CPULiteConfig
 from .data import StreamingTextCausalLMDataset, TextCausalLMDataset, collate_causal_lm
@@ -56,6 +57,21 @@ def count_causal_loss_tokens(batch: dict[str, torch.Tensor]) -> int:
     return int((labels[:, 1:] != -100).sum().item())
 
 
+def dataloader_kwargs(args: argparse.Namespace, device: torch.device, dataset) -> dict:
+    kwargs = {
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if args.num_workers > 0:
+        kwargs["persistent_workers"] = args.persistent_workers
+        kwargs["prefetch_factor"] = args.prefetch_factor
+    if isinstance(dataset, IterableDataset):
+        kwargs["shuffle"] = False
+    else:
+        kwargs["shuffle"] = True
+    return kwargs
+
+
 @torch.no_grad()
 def evaluate_loss(
     model: torch.nn.Module,
@@ -97,6 +113,7 @@ def train(args: argparse.Namespace) -> Path:
     if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = args.tf32
         torch.backends.cudnn.allow_tf32 = args.tf32
+        torch.set_float32_matmul_precision("high" if args.tf32 else "highest")
         print(f"CUDA device: {torch.cuda.get_device_name(0)}", flush=True)
         print(f"TF32: {args.tf32}", flush=True)
     tokenizer_dir = Path(args.tokenizer)
@@ -184,10 +201,8 @@ def train(args: argparse.Namespace) -> Path:
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=not args.streaming,
         collate_fn=lambda b: collate_causal_lm(b, config.pad_token_id),
-        num_workers=args.num_workers,
-        pin_memory=device.type == "cuda",
+        **dataloader_kwargs(args, device, dataset),
     )
     eval_loader = None
     if args.eval_every > 0:
@@ -241,6 +256,8 @@ def train(args: argparse.Namespace) -> Path:
     step = 0
     micro_step = 0
     running_loss = 0.0
+    running_tokens = 0
+    last_log_time = time.perf_counter()
     target = "full epoch" if args.max_steps <= 0 else str(args.max_steps)
     optim.zero_grad(set_to_none=True)
     print(
@@ -261,6 +278,7 @@ def train(args: argparse.Namespace) -> Path:
             running_loss += float(out.loss.detach().item())
             micro_step += 1
             if micro_step % args.grad_accum_steps != 0:
+                running_tokens += count_causal_loss_tokens(batch)
                 continue
             scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -269,15 +287,19 @@ def train(args: argparse.Namespace) -> Path:
             optim.zero_grad(set_to_none=True)
             step += 1
             mean_loss = running_loss / args.grad_accum_steps
+            running_tokens += count_causal_loss_tokens(batch)
             running_loss = 0.0
             if step % args.log_every == 0 or step == 1:
+                now = time.perf_counter()
+                tok_s = running_tokens / max(now - last_log_time, 1e-9)
                 ppl = math.exp(min(mean_loss, 20.0))
-                tokens = count_causal_loss_tokens(batch)
-                eff_tokens = tokens * args.grad_accum_steps
                 print(
-                    f"step {step}/{target} loss {mean_loss:.4f} ppl {ppl:.2f} tokens {eff_tokens}",
+                    f"step {step}/{target} loss {mean_loss:.4f} ppl {ppl:.2f} "
+                    f"tokens {running_tokens} tok/s {tok_s:.0f}",
                     flush=True,
                 )
+                running_tokens = 0
+                last_log_time = now
             if eval_loader is not None and (step % args.eval_every == 0 or step == 1):
                 val_loss, val_ppl = evaluate_loss(
                     model, eval_loader, device, amp_dtype, args.eval_max_batches
@@ -347,6 +369,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--foreach-optimizer", action="store_true")
     parser.add_argument("--cpu-threads", type=int, default=0)
     parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume-from", default="")
     parser.add_argument("--eval-every", type=int, default=0)
     parser.add_argument("--eval-data", default="")

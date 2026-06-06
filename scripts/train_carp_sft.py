@@ -50,7 +50,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ranking-loss-weight", type=float, default=0.5)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--amp-dtype", choices=["off", "fp16", "bf16"], default="off")
+    parser.add_argument("--tf32", action="store_true")
+    parser.add_argument("--compile", action="store_true")
     parser.add_argument("--cpu-threads", type=int, default=0)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--save-every", type=int, default=0)
     parser.add_argument("--save-step-dirs", action="store_true")
@@ -89,6 +94,11 @@ def main() -> None:
         torch.set_num_interop_threads(max(1, min(2, args.cpu_threads)))
 
     device = resolve_device(args.device)
+    if device.type == "cuda":
+        torch.backends.cuda.matmul.allow_tf32 = args.tf32
+        torch.backends.cudnn.allow_tf32 = args.tf32
+        torch.set_float32_matmul_precision("high" if args.tf32 else "highest")
+        print(f"CUDA device: {torch.cuda.get_device_name(0)} TF32={args.tf32}", flush=True)
     tokenizer = load_tokenizer(args.tokenizer)
     add_reasoning_tokens(tokenizer, args.reasoning_tokens)
 
@@ -113,18 +123,33 @@ def main() -> None:
         flush=True,
     )
 
-    model.to(device).train()
+    model.to(device)
+    if args.compile:
+        if device.type != "cuda":
+            print("Skipping torch.compile because the active device is not CUDA.", flush=True)
+        else:
+            model = torch.compile(model)  # type: ignore[assignment]
+            print("Enabled torch.compile", flush=True)
+    model.train()
     ds = CARPJsonlSFTDataset(
         args.data,
         tokenizer,
         block_size=args.block_size,
         max_reasoning_tokens=args.reasoning_tokens,
     )
+    loader_kwargs = {
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda",
+    }
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = args.persistent_workers
+        loader_kwargs["prefetch_factor"] = args.prefetch_factor
     loader = DataLoader(
         ds,
         batch_size=args.batch_size,
         shuffle=True,
         collate_fn=lambda batch: collate_carp_sft(batch, model.config.pad_token_id),
+        **loader_kwargs,
     )
 
     optim = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=args.weight_decay)
@@ -133,6 +158,7 @@ def main() -> None:
         lr_lambda=build_lr_lambda(args.max_steps, args.warmup_steps, args.min_lr_ratio),
     )
     amp_dtype = autocast_dtype(args.amp_dtype)
+    scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda" and amp_dtype == torch.float16)
 
     step = 0
     micro_step = 0
@@ -156,7 +182,7 @@ def main() -> None:
                 )
                 loss = out.loss / args.grad_accum_steps
 
-            loss.backward()
+            scaler.scale(loss).backward()
             running_loss += float(out.loss.detach())
             running_lm += float(out.lm_loss.detach())
             running_router += float(out.router_loss.detach())
@@ -168,8 +194,10 @@ def main() -> None:
             if micro_step % args.grad_accum_steps != 0:
                 continue
 
+            scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optim.step()
+            scaler.step(optim)
+            scaler.update()
             scheduler.step()
             optim.zero_grad(set_to_none=True)
             step += 1
@@ -204,7 +232,8 @@ def main() -> None:
 
 def _save_checkpoint(model, tokenizer, args: argparse.Namespace, output: Path, step: int) -> Path:
     output.mkdir(parents=True, exist_ok=True)
-    model.save_pretrained(output)
+    model_to_save = model._orig_mod if hasattr(model, "_orig_mod") else model
+    model_to_save.save_pretrained(output)
     tokenizer.save(str(output / "tokenizer.json"))
     payload = vars(args).copy()
     payload["last_step"] = step
